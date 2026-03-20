@@ -1,2 +1,2 @@
-# personalAssistant
+# Personal Ecosystem
 Hello World!
