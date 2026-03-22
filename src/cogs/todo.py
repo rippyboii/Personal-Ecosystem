@@ -23,6 +23,8 @@ class TodoCog(commands.GroupCog, group_name="todo", group_description="Manage yo
         self.bot = bot
         self.todo_service = TodoService()
         self.todo_message_map: Dict[int, Tuple[int, int]] = {}
+        self.todo_list_message_by_key: Dict[Tuple[int, int], int] = {}
+        self.todo_completed_message_by_key: Dict[Tuple[int, int], int] = {}
 
     @app_commands.command(name="add", description="Add a new todo item")
     @app_commands.describe(task="The task you want to add")
@@ -66,6 +68,7 @@ class TodoCog(commands.GroupCog, group_name="todo", group_description="Manage yo
             todo = self.todo_service.complete_todo(interaction.user.id, todo_id)
             await interaction.response.send_message(f"Completed todo #{todo.id}: {todo.task}")
             await self._send_todo_completed_update(interaction, todo)
+            await self._delete_todo_list_message(interaction.user.id, todo.id)
             self._remove_todo_message_mapping(interaction.user.id, todo.id)
         except TodoNotFoundError:
             await interaction.response.send_message(
@@ -84,6 +87,8 @@ class TodoCog(commands.GroupCog, group_name="todo", group_description="Manage yo
         try:
             todo = self.todo_service.delete_todo(interaction.user.id, todo_id)
             await interaction.response.send_message(f"Deleted todo #{todo.id}: {todo.task}")
+            await self._delete_todo_list_message(interaction.user.id, todo.id)
+            await self._delete_todo_completed_message(interaction.user.id, todo.id)
             self._remove_todo_message_mapping(interaction.user.id, todo.id)
         except TodoNotFoundError:
             await interaction.response.send_message(
@@ -108,6 +113,7 @@ class TodoCog(commands.GroupCog, group_name="todo", group_description="Manage yo
             )
             await message.add_reaction(WHITE_CHECK_MARK)
             self.todo_message_map[message.id] = (interaction.user.id, todo.id)
+            self.todo_list_message_by_key[(interaction.user.id, todo.id)] = message.id
         except discord.DiscordException:
             return
 
@@ -163,32 +169,28 @@ class TodoCog(commands.GroupCog, group_name="todo", group_description="Manage yo
         try:
             todo = self.todo_service.complete_todo(owner_user_id, todo_id)
             await self._send_todo_completed_update_by_user_id(owner_user_id, todo)
-            channel = self.bot.get_channel(payload.channel_id)
-            if isinstance(channel, Messageable):
-                message = await channel.fetch_message(payload.message_id)
-                await message.edit(
-                    content=(
-                        f"Completed todo from <@{owner_user_id}>: #{todo.id} {todo.task}\n"
-                        f"Task created on: {self._format_timestamp(todo.created_at)}\n"
-                        f"Task completed on: {self._format_timestamp(todo.completed_at)}"
-                    )
-                )
+            await self._delete_todo_list_message(owner_user_id, todo.id, payload.message_id)
             self.todo_message_map.pop(payload.message_id, None)
         except (TodoServiceError, discord.DiscordException):
             return
 
     async def _send_todo_completed_update_by_user_id(self, user_id: int, todo: TodoItem) -> None:
+        key = (user_id, todo.id)
+        if key in self.todo_completed_message_by_key:
+            return
+
         channel = await self._resolve_channel(todo_completed_channel_id)
         if channel is None:
             return
 
         completed_text = self._format_timestamp(todo.completed_at) if todo.completed_at else "N/A"
         try:
-            await channel.send(
+            message = await channel.send(
                 f"Completed todo from <@{user_id}>: #{todo.id} {todo.task}\n"
                 f"Task created on: {self._format_timestamp(todo.created_at)}\n"
                 f"Task completed on: {completed_text}"
             )
+            self.todo_completed_message_by_key[key] = message.id
         except discord.DiscordException:
             return
 
@@ -205,6 +207,38 @@ class TodoCog(commands.GroupCog, group_name="todo", group_description="Manage yo
             owner_user_id, mapped_todo_id = mapping
             if owner_user_id == user_id and mapped_todo_id == todo_id:
                 self.todo_message_map.pop(message_id, None)
+        self.todo_list_message_by_key.pop((user_id, todo_id), None)
+
+    async def _delete_todo_list_message(
+        self, user_id: int, todo_id: int, message_id_override: int | None = None
+    ) -> None:
+        key = (user_id, todo_id)
+        message_id = message_id_override or self.todo_list_message_by_key.get(key)
+        if message_id is None:
+            return
+
+        await self._delete_message(todo_list_channel_id, message_id)
+        self.todo_message_map.pop(message_id, None)
+        self.todo_list_message_by_key.pop(key, None)
+
+    async def _delete_todo_completed_message(self, user_id: int, todo_id: int) -> None:
+        key = (user_id, todo_id)
+        message_id = self.todo_completed_message_by_key.get(key)
+        if message_id is None:
+            return
+
+        await self._delete_message(todo_completed_channel_id, message_id)
+        self.todo_completed_message_by_key.pop(key, None)
+
+    async def _delete_message(self, channel_id: str | None, message_id: int) -> None:
+        channel = await self._resolve_channel(channel_id)
+        if channel is None or not hasattr(channel, "fetch_message"):
+            return
+        try:
+            message = await channel.fetch_message(message_id)
+            await message.delete()
+        except discord.DiscordException:
+            return
 
 
 async def setup(bot: commands.Bot) -> None:
