@@ -1,12 +1,21 @@
 import discord
 from discord.ext import commands
+
 from config import TOKEN, bot_log_channel_id
 
+
 intents = discord.Intents.default()
-pes = commands.Bot(command_prefix='!', intents=intents)
+pes = commands.Bot(command_prefix="!", intents=intents)
+
 
 @pes.event
-async def on_ready():
+async def setup_hook() -> None:
+    await pes.load_extension("cogs.todo")
+    await pes.tree.sync()
+
+
+@pes.event
+async def on_ready() -> None:
     print(f"Logged in as {pes.user}")
 
     if bot_log_channel_id:
@@ -14,12 +23,13 @@ async def on_ready():
         if channel:
             await channel.send("Hi <@722011173154717777>, I'm online!")
         if not channel:
-            raise ValueError (f"Channel with ID {bot_log_channel_id} not found.")
+            raise ValueError(f"Channel with ID {bot_log_channel_id} not found.")
     print("Bot is ONLINE! BINGO!!")
 
-def main():
+
+def main() -> None:
     pes.run(TOKEN)
+
 
 if __name__ == "__main__":
     main()
-    
