@@ -110,7 +110,9 @@ class TodoCog(commands.GroupCog, group_name="todo", group_description="Manage yo
 
         try:
             embed = self._build_todo_list_embed(interaction.user, todo)
+            focus_text = self._build_focus_heading(todo.task, "📝")
             message = await channel.send(
+                content=focus_text,
                 embed=embed
             )
             await message.add_reaction(WHITE_CHECK_MARK)
@@ -188,8 +190,9 @@ class TodoCog(commands.GroupCog, group_name="todo", group_description="Manage yo
         completed_text = self._format_timestamp(todo.completed_at) if todo.completed_at else "N/A"
         try:
             embed = self._build_todo_completed_embed(user_id, todo, completed_text)
+            focus_text = self._build_focus_heading(todo.task, "✅")
             message = await channel.send(
-                content=f"<@{user_id}>",
+                content=f"<@{user_id}>\n{focus_text}",
                 embed=embed,
             )
             self.todo_completed_message_by_key[key] = message.id
@@ -199,10 +202,10 @@ class TodoCog(commands.GroupCog, group_name="todo", group_description="Manage yo
     def _build_todo_list_embed(self, user: discord.User | discord.Member, todo: TodoItem) -> discord.Embed:
         embed = discord.Embed(
             title=f"Task #{todo.id}",
-            description=todo.task,
             color=TODO_LIST_COLOR,
         )
         embed.set_author(name=f"{user.display_name} added a new todo", icon_url=user.display_avatar.url)
+        embed.add_field(name="Task", value=self._format_task_body(todo.task), inline=False)
         embed.add_field(name="Status", value="Pending", inline=True)
         embed.add_field(name="Created", value=self._format_timestamp(todo.created_at), inline=True)
         embed.set_footer(text="React with ✅ to complete this task")
@@ -211,14 +214,24 @@ class TodoCog(commands.GroupCog, group_name="todo", group_description="Manage yo
     def _build_todo_completed_embed(self, user_id: int, todo: TodoItem, completed_text: str) -> discord.Embed:
         embed = discord.Embed(
             title=f"Completed Task #{todo.id}",
-            description=todo.task,
             color=TODO_COMPLETED_COLOR,
         )
+        embed.add_field(name="Task", value=self._format_task_body(todo.task), inline=False)
         embed.add_field(name="Owner", value=f"<@{user_id}>", inline=True)
         embed.add_field(name="Created", value=self._format_timestamp(todo.created_at), inline=True)
         embed.add_field(name="Completed", value=completed_text, inline=False)
         embed.set_footer(text="Great progress")
         return embed
+
+    def _build_focus_heading(self, task: str, icon: str) -> str:
+        single_line = " ".join(task.splitlines()).strip()
+        if len(single_line) > 120:
+            single_line = single_line[:117] + "..."
+        return f"## {icon} {single_line}"
+
+    def _format_task_body(self, task: str) -> str:
+        cleaned = task.replace("```", "`\u200b``")
+        return f"> {cleaned}"
 
     def _to_int(self, value: str | None) -> int | None:
         if not value:
