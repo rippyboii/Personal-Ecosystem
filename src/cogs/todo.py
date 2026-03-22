@@ -1,15 +1,16 @@
-from datetime import datetime
+import re
+from datetime import datetime, timezone
 from typing import Dict, Tuple
 
 import discord
 from discord import app_commands
-from discord.ext import commands
 from discord.abc import Messageable
+from discord.ext import commands
 
 from config import todo_completed_channel_id, todo_list_channel_id
 from services.todo_service import (
-    TodoNotFoundError,
     TodoItem,
+    TodoNotFoundError,
     TodoService,
     TodoServiceError,
     TodoValidationError,
@@ -27,6 +28,17 @@ class TodoCog(commands.GroupCog, group_name="todo", group_description="Manage yo
         self.todo_message_map: Dict[int, Tuple[int, int]] = {}
         self.todo_list_message_by_key: Dict[Tuple[int, int], int] = {}
         self.todo_completed_message_by_key: Dict[Tuple[int, int], int] = {}
+        self._state_restored = False
+
+    @commands.Cog.listener()
+    async def on_ready(self) -> None:
+        if self._state_restored:
+            return
+        try:
+            await self._restore_state_from_channels()
+            self._state_restored = True
+        except discord.DiscordException:
+            self._state_restored = False
 
     @app_commands.command(name="add", description="Add a new todo item")
     @app_commands.describe(task="The task you want to add")
@@ -111,10 +123,7 @@ class TodoCog(commands.GroupCog, group_name="todo", group_description="Manage yo
         try:
             embed = self._build_todo_list_embed(interaction.user, todo)
             focus_text = self._build_focus_heading(todo.task, "📝")
-            message = await channel.send(
-                content=focus_text,
-                embed=embed
-            )
+            message = await channel.send(content=focus_text, embed=embed)
             await message.add_reaction(WHITE_CHECK_MARK)
             self.todo_message_map[message.id] = (interaction.user.id, todo.id)
             self.todo_list_message_by_key[(interaction.user.id, todo.id)] = message.id
@@ -191,10 +200,7 @@ class TodoCog(commands.GroupCog, group_name="todo", group_description="Manage yo
         try:
             embed = self._build_todo_completed_embed(user_id, todo, completed_text)
             focus_text = self._build_focus_heading(todo.task, "✅")
-            message = await channel.send(
-                content=f"<@{user_id}>\n{focus_text}",
-                embed=embed,
-            )
+            message = await channel.send(content=f"<@{user_id}>\n{focus_text}", embed=embed)
             self.todo_completed_message_by_key[key] = message.id
         except discord.DiscordException:
             return
@@ -205,9 +211,10 @@ class TodoCog(commands.GroupCog, group_name="todo", group_description="Manage yo
             color=TODO_LIST_COLOR,
         )
         embed.set_author(name=f"{user.display_name} added a new todo", icon_url=user.display_avatar.url)
-        embed.add_field(name="Task", value=self._format_task_body(todo.task), inline=False)
+        embed.add_field(name="Owner", value=f"<@{user.id}>", inline=True)
         embed.add_field(name="Status", value="Pending", inline=True)
-        embed.add_field(name="Created", value=self._format_timestamp(todo.created_at), inline=True)
+        embed.add_field(name="Created", value=self._format_timestamp(todo.created_at), inline=False)
+        embed.add_field(name="Task", value=self._format_task_body(todo.task), inline=False)
         embed.set_footer(text="React with ✅ to complete this task")
         return embed
 
@@ -216,10 +223,10 @@ class TodoCog(commands.GroupCog, group_name="todo", group_description="Manage yo
             title=f"Completed Task #{todo.id}",
             color=TODO_COMPLETED_COLOR,
         )
-        embed.add_field(name="Task", value=self._format_task_body(todo.task), inline=False)
         embed.add_field(name="Owner", value=f"<@{user_id}>", inline=True)
         embed.add_field(name="Created", value=self._format_timestamp(todo.created_at), inline=True)
-        embed.add_field(name="Completed", value=completed_text, inline=False)
+        embed.add_field(name="Completed", value=completed_text, inline=True)
+        embed.add_field(name="Task", value=self._format_task_body(todo.task), inline=False)
         embed.set_footer(text="Great progress")
         return embed
 
@@ -231,7 +238,8 @@ class TodoCog(commands.GroupCog, group_name="todo", group_description="Manage yo
 
     def _format_task_body(self, task: str) -> str:
         cleaned = task.replace("```", "`\u200b``")
-        return f"> {cleaned}"
+        lines = cleaned.splitlines() or [cleaned]
+        return "\n".join(f"> {line}" if line else ">" for line in lines)
 
     def _to_int(self, value: str | None) -> int | None:
         if not value:
@@ -278,6 +286,148 @@ class TodoCog(commands.GroupCog, group_name="todo", group_description="Manage yo
             await message.delete()
         except discord.DiscordException:
             return
+
+    async def _restore_state_from_channels(self) -> None:
+        self.todo_service.reset()
+        self.todo_message_map.clear()
+        self.todo_list_message_by_key.clear()
+        self.todo_completed_message_by_key.clear()
+
+        max_id_by_user: Dict[int, int] = {}
+
+        list_channel = await self._resolve_channel(todo_list_channel_id)
+        if list_channel is not None and hasattr(list_channel, "history"):
+            async for message in list_channel.history(limit=None, oldest_first=True):
+                parsed = self._parse_list_message(message)
+                if parsed is None:
+                    continue
+
+                user_id, todo_id, task, created_at = parsed
+                todo = TodoItem(id=todo_id, task=task, completed=False, created_at=created_at)
+                self.todo_service.load_todo(user_id, todo)
+
+                self.todo_message_map[message.id] = (user_id, todo_id)
+                self.todo_list_message_by_key[(user_id, todo_id)] = message.id
+                max_id_by_user[user_id] = max(max_id_by_user.get(user_id, 0), todo_id)
+
+        completed_channel = await self._resolve_channel(todo_completed_channel_id)
+        if completed_channel is not None and hasattr(completed_channel, "history"):
+            async for message in completed_channel.history(limit=None, oldest_first=True):
+                parsed = self._parse_completed_message(message)
+                if parsed is None:
+                    continue
+
+                user_id, todo_id = parsed
+                self.todo_completed_message_by_key[(user_id, todo_id)] = message.id
+                max_id_by_user[user_id] = max(max_id_by_user.get(user_id, 0), todo_id)
+
+        for user_id, max_id in max_id_by_user.items():
+            self.todo_service.ensure_next_id(user_id, max_id + 1)
+
+    def _parse_list_message(self, message: discord.Message) -> tuple[int, int, str, datetime] | None:
+        if not message.embeds:
+            return None
+        embed = message.embeds[0]
+        todo_id = self._extract_todo_id(embed.title)
+        if todo_id is None:
+            return None
+
+        user_id = self._extract_owner_id(embed, message.content)
+        if user_id is None:
+            user_id = self._extract_owner_id_from_message(message)
+        if user_id is None:
+            return None
+
+        task = self._extract_task(embed, message.content)
+        if not task:
+            return None
+
+        created_at = self._extract_field_timestamp(embed, "Created") or message.created_at
+        created_at = created_at.astimezone(timezone.utc)
+        return user_id, todo_id, task, created_at
+
+    def _parse_completed_message(self, message: discord.Message) -> tuple[int, int] | None:
+        if not message.embeds:
+            return None
+        embed = message.embeds[0]
+        todo_id = self._extract_todo_id(embed.title)
+        if todo_id is None:
+            return None
+
+        user_id = self._extract_owner_id(embed, message.content)
+        if user_id is None:
+            user_id = self._extract_owner_id_from_message(message)
+        if user_id is None:
+            return None
+        return user_id, todo_id
+
+    def _extract_todo_id(self, title: str | None) -> int | None:
+        if not title:
+            return None
+        match = re.search(r"(?:Completed\s+)?Task\s+#(\d+)", title)
+        if not match:
+            return None
+        return int(match.group(1))
+
+    def _extract_owner_id(self, embed: discord.Embed, content: str | None) -> int | None:
+        owner_field = self._embed_field_value(embed, "Owner")
+        if owner_field:
+            match = re.search(r"<@!?(\d+)>", owner_field)
+            if match:
+                return int(match.group(1))
+
+        if content:
+            match = re.search(r"<@!?(\d+)>", content)
+            if match:
+                return int(match.group(1))
+
+        # Fallback for older bot messages where owner field wasn't present.
+        return None
+
+    def _extract_owner_id_from_message(self, message: discord.Message) -> int | None:
+        interaction = getattr(message, "interaction", None)
+        if interaction and getattr(interaction, "user", None):
+            return interaction.user.id
+
+        return None
+
+    def _extract_task(self, embed: discord.Embed, content: str | None) -> str | None:
+        task_field = self._embed_field_value(embed, "Task")
+        if task_field:
+            lines = [line.lstrip("> ") for line in task_field.splitlines()]
+            task = "\n".join(lines).strip()
+            if task:
+                return task
+
+        if embed.description and embed.description.strip():
+            return embed.description.strip()
+
+        if content:
+            heading_match = re.search(r"^##\s+[^\n]*", content, re.MULTILINE)
+            if heading_match:
+                heading = heading_match.group(0)
+                heading = re.sub(r"^##\s+", "", heading).strip()
+                heading = re.sub(r"^[^\w]+", "", heading).strip()
+                if heading:
+                    return heading
+
+        return None
+
+    def _extract_field_timestamp(self, embed: discord.Embed, field_name: str) -> datetime | None:
+        value = self._embed_field_value(embed, field_name)
+        if not value:
+            return None
+
+        match = re.search(r"<t:(\d+)(?::[a-zA-Z])?>", value)
+        if not match:
+            return None
+        return datetime.fromtimestamp(int(match.group(1)), tz=timezone.utc)
+
+    def _embed_field_value(self, embed: discord.Embed, name: str) -> str | None:
+        for field in embed.fields:
+            if field.name.strip().lower() == name.lower():
+                return field.value
+        return None
 
 
 async def setup(bot: commands.Bot) -> None:

@@ -42,6 +42,26 @@ class TodoService:
     def list_todos(self, user_id: int) -> List[TodoItem]:
         return list(self._todos_by_user.get(user_id, []))
 
+    def reset(self) -> None:
+        self._todos_by_user.clear()
+        self._next_id_by_user.clear()
+
+    def load_todo(self, user_id: int, todo: TodoItem) -> None:
+        todos = self._todos_by_user.setdefault(user_id, [])
+        for index, existing in enumerate(todos):
+            if existing.id == todo.id:
+                todos[index] = todo
+                break
+        else:
+            todos.append(todo)
+
+        self.ensure_next_id(user_id, todo.id + 1)
+
+    def ensure_next_id(self, user_id: int, next_id: int) -> None:
+        current = self._next_id_by_user.get(user_id, 1)
+        if next_id > current:
+            self._next_id_by_user[user_id] = next_id
+
     def complete_todo(self, user_id: int, todo_id: int) -> TodoItem:
         todo = self._get_todo_by_id(user_id, todo_id)
         if not todo.completed:
