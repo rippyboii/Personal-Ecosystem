@@ -49,7 +49,8 @@ class TodoCog(commands.GroupCog, group_name="todo", group_description="Manage yo
             await self._send_todo_list_update(interaction, todo)
         except TodoValidationError as error:
             await interaction.response.send_message(f"I couldn't add that todo: {error}", ephemeral=True)
-        except TodoServiceError:
+        except TodoServiceError as error:
+            await self._report_error("TodoCog.add_todo", error)
             await interaction.response.send_message(
                 "Something went wrong while adding your todo. Please try again.",
                 ephemeral=True,
@@ -69,7 +70,8 @@ class TodoCog(commands.GroupCog, group_name="todo", group_description="Manage yo
                 lines.append(f"{status} #{todo.id} {todo.task}")
 
             await interaction.response.send_message("Your todos:\n" + "\n".join(lines))
-        except TodoServiceError:
+        except TodoServiceError as error:
+            await self._report_error("TodoCog.list_todos", error)
             await interaction.response.send_message(
                 "Something went wrong while reading your todos. Please try again.",
                 ephemeral=True,
@@ -89,7 +91,8 @@ class TodoCog(commands.GroupCog, group_name="todo", group_description="Manage yo
                 f"I couldn't find todo #{todo_id}. Use `/todo list` to check IDs.",
                 ephemeral=True,
             )
-        except TodoServiceError:
+        except TodoServiceError as error:
+            await self._report_error("TodoCog.complete_todo", error)
             await interaction.response.send_message(
                 "Something went wrong while updating your todo. Please try again.",
                 ephemeral=True,
@@ -109,7 +112,8 @@ class TodoCog(commands.GroupCog, group_name="todo", group_description="Manage yo
                 f"I couldn't find todo #{todo_id}. Use `/todo list` to check IDs.",
                 ephemeral=True,
             )
-        except TodoServiceError:
+        except TodoServiceError as error:
+            await self._report_error("TodoCog.delete_todo", error)
             await interaction.response.send_message(
                 "Something went wrong while deleting your todo. Please try again.",
                 ephemeral=True,
@@ -385,9 +389,9 @@ class TodoCog(commands.GroupCog, group_name="todo", group_description="Manage yo
         return None
 
     def _extract_owner_id_from_message(self, message: discord.Message) -> int | None:
-        interaction = getattr(message, "interaction", None)
-        if interaction and getattr(interaction, "user", None):
-            return interaction.user.id
+        interaction_metadata = getattr(message, "interaction_metadata", None)
+        if interaction_metadata and getattr(interaction_metadata, "user", None):
+            return interaction_metadata.user.id
 
         return None
 
@@ -428,6 +432,12 @@ class TodoCog(commands.GroupCog, group_name="todo", group_description="Manage yo
             if field.name.strip().lower() == name.lower():
                 return field.value
         return None
+
+    async def _report_error(self, source: str, error: BaseException) -> None:
+        reporter = getattr(self.bot, "error_reporter", None)
+        if reporter is None:
+            return
+        await reporter.report_exception(source, error)
 
 
 async def setup(bot: commands.Bot) -> None:
