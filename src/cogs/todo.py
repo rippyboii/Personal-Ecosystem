@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Dict, Tuple
 
 import discord
 from discord import app_commands
@@ -14,10 +15,14 @@ from services.todo_service import (
     TodoValidationError,
 )
 
+WHITE_CHECK_MARK = "\N{WHITE HEAVY CHECK MARK}"
+
+
 class TodoCog(commands.GroupCog, group_name="todo", group_description="Manage your todo list"):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
         self.todo_service = TodoService()
+        self.todo_message_map: Dict[int, Tuple[int, int]] = {}
 
     @app_commands.command(name="add", description="Add a new todo item")
     @app_commands.describe(task="The task you want to add")
@@ -61,6 +66,7 @@ class TodoCog(commands.GroupCog, group_name="todo", group_description="Manage yo
             todo = self.todo_service.complete_todo(interaction.user.id, todo_id)
             await interaction.response.send_message(f"Completed todo #{todo.id}: {todo.task}")
             await self._send_todo_completed_update(interaction, todo)
+            self._remove_todo_message_mapping(interaction.user.id, todo.id)
         except TodoNotFoundError:
             await interaction.response.send_message(
                 f"I couldn't find todo #{todo_id}. Use `/todo list` to check IDs.",
@@ -78,6 +84,7 @@ class TodoCog(commands.GroupCog, group_name="todo", group_description="Manage yo
         try:
             todo = self.todo_service.delete_todo(interaction.user.id, todo_id)
             await interaction.response.send_message(f"Deleted todo #{todo.id}: {todo.task}")
+            self._remove_todo_message_mapping(interaction.user.id, todo.id)
         except TodoNotFoundError:
             await interaction.response.send_message(
                 f"I couldn't find todo #{todo_id}. Use `/todo list` to check IDs.",
@@ -95,27 +102,17 @@ class TodoCog(commands.GroupCog, group_name="todo", group_description="Manage yo
             return
 
         try:
-            await channel.send(
+            message = await channel.send(
                 f"New todo from {interaction.user.mention}: #{todo.id} {todo.task}\n"
                 f"Task created on: {self._format_timestamp(todo.created_at)}"
             )
+            await message.add_reaction(WHITE_CHECK_MARK)
+            self.todo_message_map[message.id] = (interaction.user.id, todo.id)
         except discord.DiscordException:
             return
 
     async def _send_todo_completed_update(self, interaction: discord.Interaction, todo: TodoItem) -> None:
-        channel = await self._resolve_channel(todo_completed_channel_id)
-        if channel is None:
-            return
-
-        completed_text = self._format_timestamp(todo.completed_at) if todo.completed_at else "N/A"
-        try:
-            await channel.send(
-                f"Completed todo from {interaction.user.mention}: #{todo.id} {todo.task}\n"
-                f"Task created on: {self._format_timestamp(todo.created_at)}\n"
-                f"Task completed on: {completed_text}"
-            )
-        except discord.DiscordException:
-            return
+        await self._send_todo_completed_update_by_user_id(interaction.user.id, todo)
 
     async def _resolve_channel(self, channel_id: str | None) -> Messageable | None:
         if not channel_id:
@@ -142,6 +139,72 @@ class TodoCog(commands.GroupCog, group_name="todo", group_description="Manage yo
             return "N/A"
         unix_ts = int(value.timestamp())
         return f"<t:{unix_ts}:F>"
+
+    @commands.Cog.listener()
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
+        bot_user_id = self.bot.user.id if self.bot.user else None
+        if payload.user_id == bot_user_id:
+            return
+        if str(payload.emoji) != WHITE_CHECK_MARK:
+            return
+
+        mapping = self.todo_message_map.get(payload.message_id)
+        if mapping is None:
+            return
+
+        owner_user_id, todo_id = mapping
+        if payload.user_id != owner_user_id:
+            return
+
+        list_channel_id = self._to_int(todo_list_channel_id)
+        if list_channel_id is not None and payload.channel_id != list_channel_id:
+            return
+
+        try:
+            todo = self.todo_service.complete_todo(owner_user_id, todo_id)
+            await self._send_todo_completed_update_by_user_id(owner_user_id, todo)
+            channel = self.bot.get_channel(payload.channel_id)
+            if isinstance(channel, Messageable):
+                message = await channel.fetch_message(payload.message_id)
+                await message.edit(
+                    content=(
+                        f"Completed todo from <@{owner_user_id}>: #{todo.id} {todo.task}\n"
+                        f"Task created on: {self._format_timestamp(todo.created_at)}\n"
+                        f"Task completed on: {self._format_timestamp(todo.completed_at)}"
+                    )
+                )
+            self.todo_message_map.pop(payload.message_id, None)
+        except (TodoServiceError, discord.DiscordException):
+            return
+
+    async def _send_todo_completed_update_by_user_id(self, user_id: int, todo: TodoItem) -> None:
+        channel = await self._resolve_channel(todo_completed_channel_id)
+        if channel is None:
+            return
+
+        completed_text = self._format_timestamp(todo.completed_at) if todo.completed_at else "N/A"
+        try:
+            await channel.send(
+                f"Completed todo from <@{user_id}>: #{todo.id} {todo.task}\n"
+                f"Task created on: {self._format_timestamp(todo.created_at)}\n"
+                f"Task completed on: {completed_text}"
+            )
+        except discord.DiscordException:
+            return
+
+    def _to_int(self, value: str | None) -> int | None:
+        if not value:
+            return None
+        try:
+            return int(value)
+        except ValueError:
+            return None
+
+    def _remove_todo_message_mapping(self, user_id: int, todo_id: int) -> None:
+        for message_id, mapping in list(self.todo_message_map.items()):
+            owner_user_id, mapped_todo_id = mapping
+            if owner_user_id == user_id and mapped_todo_id == todo_id:
+                self.todo_message_map.pop(message_id, None)
 
 
 async def setup(bot: commands.Bot) -> None:
