@@ -1,6 +1,7 @@
 import re
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Dict, Tuple
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import discord
 from discord import app_commands
@@ -18,6 +19,337 @@ from services.reminder_service import (
 
 REMINDER_LIST_COLOR = 0xF59E0B
 REMINDER_DUE_SOON_COLOR = 0xF97316
+PICKER_TIMEZONE_CHOICES = [
+    ("UTC", "UTC"),
+    ("Europe/Stockholm", "Europe/Stockholm"),
+    ("America/New_York", "America/New_York"),
+    ("America/Chicago", "America/Chicago"),
+    ("America/Los_Angeles", "America/Los_Angeles"),
+    ("Asia/Singapore", "Asia/Singapore"),
+    ("Asia/Tokyo", "Asia/Tokyo"),
+    ("Australia/Sydney", "Australia/Sydney"),
+]
+
+
+class ReminderDateSelect(discord.ui.Select):
+    def __init__(self, picker_view: "ReminderDatePickerView") -> None:
+        self.picker_view = picker_view
+        super().__init__(
+            placeholder="Select due date",
+            min_values=1,
+            max_values=1,
+            options=self.picker_view.build_date_options(),
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        self.picker_view.selected_date = date.fromisoformat(self.values[0])
+        await self.picker_view.refresh_message(interaction)
+
+
+class ReminderTimezoneSelect(discord.ui.Select):
+    def __init__(self, picker_view: "ReminderDatePickerView") -> None:
+        self.picker_view = picker_view
+        super().__init__(
+            placeholder="Select timezone",
+            min_values=1,
+            max_values=1,
+            options=self.picker_view.build_timezone_options(),
+            row=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        self.picker_view.timezone_name = self.values[0]
+        await self.picker_view.refresh_message(interaction)
+
+
+class ReminderHourSelect(discord.ui.Select):
+    def __init__(self, picker_view: "ReminderDatePickerView") -> None:
+        self.picker_view = picker_view
+        super().__init__(
+            placeholder="Select hour",
+            min_values=1,
+            max_values=1,
+            options=self.picker_view.build_hour_options(),
+            row=2,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        self.picker_view.selected_hour = int(self.values[0])
+        await self.picker_view.refresh_message(interaction)
+
+
+class ReminderMinuteSelect(discord.ui.Select):
+    def __init__(self, picker_view: "ReminderDatePickerView") -> None:
+        self.picker_view = picker_view
+        super().__init__(
+            placeholder="Select minute",
+            min_values=1,
+            max_values=1,
+            options=self.picker_view.build_minute_options(),
+            row=3,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        self.picker_view.selected_minute = int(self.values[0])
+        await self.picker_view.refresh_message(interaction)
+
+
+class ReminderPreviousDatesButton(discord.ui.Button):
+    def __init__(self, picker_view: "ReminderDatePickerView") -> None:
+        self.picker_view = picker_view
+        super().__init__(label="Earlier Dates", style=discord.ButtonStyle.secondary, row=4)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        self.picker_view.shift_date_window(-self.picker_view.DATE_PAGE_SIZE)
+        await self.picker_view.refresh_message(interaction)
+
+
+class ReminderNextDatesButton(discord.ui.Button):
+    def __init__(self, picker_view: "ReminderDatePickerView") -> None:
+        self.picker_view = picker_view
+        super().__init__(label="Later Dates", style=discord.ButtonStyle.secondary, row=4)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        self.picker_view.shift_date_window(self.picker_view.DATE_PAGE_SIZE)
+        await self.picker_view.refresh_message(interaction)
+
+
+class ReminderCreateButton(discord.ui.Button):
+    def __init__(self, picker_view: "ReminderDatePickerView") -> None:
+        self.picker_view = picker_view
+        super().__init__(label="Create Reminder", style=discord.ButtonStyle.success, row=4)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        due_at = self.picker_view.selected_due_at_utc()
+        if due_at <= datetime.now(timezone.utc):
+            await self.picker_view.refresh_message(interaction, "Selected due time must be in the future.")
+            return
+
+        try:
+            reminder_item = self.picker_view.cog.reminder_service.add_reminder(
+                interaction.user.id,
+                self.picker_view.reminder_text,
+                due_at,
+            )
+            await self.picker_view.cog._send_reminder_list_update(interaction.user, reminder_item)
+            await self.picker_view.cog._check_due_reminders()
+        except ReminderValidationError as error:
+            await self.picker_view.refresh_message(interaction, f"I couldn't add that reminder: {error}")
+            return
+        except ReminderServiceError as error:
+            await self.picker_view.cog._report_error("ReminderDatePickerView.create", error)
+            await self.picker_view.refresh_message(
+                interaction,
+                "Something went wrong while creating your reminder. Please try again.",
+            )
+            return
+
+        self.picker_view.stop()
+        await interaction.response.edit_message(
+            content=(
+                f"Added reminder #{reminder_item.id} due "
+                f"{self.picker_view.cog._format_timestamp(reminder_item.due_at)}."
+            ),
+            view=None,
+        )
+
+
+class ReminderCancelButton(discord.ui.Button):
+    def __init__(self, picker_view: "ReminderDatePickerView") -> None:
+        self.picker_view = picker_view
+        super().__init__(label="Cancel", style=discord.ButtonStyle.danger, row=4)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        self.picker_view.stop()
+        await interaction.response.edit_message(content="Reminder creation cancelled.", view=None)
+
+
+class ReminderDatePickerView(discord.ui.View):
+    DATE_PAGE_SIZE = 25
+
+    def __init__(self, cog: "ReminderCog", requester_id: int, reminder_text: str) -> None:
+        super().__init__(timeout=900)
+        self.cog = cog
+        self.requester_id = requester_id
+        self.reminder_text = reminder_text
+
+        suggested_due = (datetime.now(timezone.utc) + timedelta(hours=1)).replace(
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        self.selected_date = suggested_due.date()
+        self.selected_hour = suggested_due.hour
+        self.selected_minute = 0
+        self.timezone_name = "UTC"
+        self.date_page_start = self.selected_date
+        self.message: discord.Message | None = None
+
+        self.date_select = ReminderDateSelect(self)
+        self.timezone_select = ReminderTimezoneSelect(self)
+        self.hour_select = ReminderHourSelect(self)
+        self.minute_select = ReminderMinuteSelect(self)
+        self.previous_dates_button = ReminderPreviousDatesButton(self)
+        self.next_dates_button = ReminderNextDatesButton(self)
+        self.create_button = ReminderCreateButton(self)
+        self.cancel_button = ReminderCancelButton(self)
+
+        self.add_item(self.date_select)
+        self.add_item(self.timezone_select)
+        self.add_item(self.hour_select)
+        self.add_item(self.minute_select)
+        self.add_item(self.previous_dates_button)
+        self.add_item(self.next_dates_button)
+        self.add_item(self.create_button)
+        self.add_item(self.cancel_button)
+
+        self.sync_component_state()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.requester_id:
+            return True
+        await interaction.response.send_message(
+            "Only the user who started this reminder setup can use these controls.",
+            ephemeral=True,
+        )
+        return False
+
+    async def on_timeout(self) -> None:
+        for child in self.children:
+            child.disabled = True
+        if self.message is None:
+            return
+        try:
+            await self.message.edit(
+                content="Reminder setup timed out. Run `/reminder add` again.",
+                view=self,
+            )
+        except discord.DiscordException:
+            return
+
+    def shift_date_window(self, delta_days: int) -> None:
+        minimum_date = self.minimum_allowed_date()
+        proposed_start = self.date_page_start + timedelta(days=delta_days)
+        if proposed_start < minimum_date:
+            proposed_start = minimum_date
+
+        self.date_page_start = proposed_start
+        if not self.date_is_visible(self.selected_date):
+            self.selected_date = self.date_page_start
+
+    def date_is_visible(self, selected: date) -> bool:
+        window_end = self.date_page_start + timedelta(days=self.DATE_PAGE_SIZE - 1)
+        return self.date_page_start <= selected <= window_end
+
+    def minimum_allowed_date(self) -> date:
+        return datetime.now(timezone.utc).date()
+
+    def sync_component_state(self) -> None:
+        minimum_date = self.minimum_allowed_date()
+        if self.date_page_start < minimum_date:
+            self.date_page_start = minimum_date
+        if self.selected_date < minimum_date:
+            self.selected_date = minimum_date
+        if not self.date_is_visible(self.selected_date):
+            self.selected_date = self.date_page_start
+
+        self.date_select.options = self.build_date_options()
+        self.timezone_select.options = self.build_timezone_options()
+        self.hour_select.options = self.build_hour_options()
+        self.minute_select.options = self.build_minute_options()
+
+        self.previous_dates_button.disabled = self.date_page_start <= minimum_date
+        self.create_button.disabled = self.selected_due_at_utc() <= datetime.now(timezone.utc)
+
+    async def refresh_message(self, interaction: discord.Interaction, notice: str | None = None) -> None:
+        self.sync_component_state()
+        await interaction.response.edit_message(content=self.build_prompt_text(notice), view=self)
+
+    def build_prompt_text(self, notice: str | None = None) -> str:
+        due_at = self.selected_due_at_utc()
+        window_end = self.date_page_start + timedelta(days=self.DATE_PAGE_SIZE - 1)
+
+        lines = [
+            "Use the picker below to set reminder due date and time.",
+            f"Reminder: {self.reminder_text}",
+            f"Selected due: {self.cog._format_timestamp(due_at)} ({self.cog._format_relative_timestamp(due_at)})",
+            f"Timezone: `{self.timezone_name}`",
+            f"Date window: `{self.date_page_start.isoformat()}` to `{window_end.isoformat()}`",
+        ]
+        if due_at <= datetime.now(timezone.utc):
+            lines.append("Selected due time must be in the future.")
+        if notice:
+            lines.append(notice)
+        return "\n".join(lines)
+
+    def build_date_options(self) -> list[discord.SelectOption]:
+        options: list[discord.SelectOption] = []
+        for day_offset in range(self.DATE_PAGE_SIZE):
+            current_date = self.date_page_start + timedelta(days=day_offset)
+            options.append(
+                discord.SelectOption(
+                    label=current_date.strftime("%a %d %b %Y"),
+                    value=current_date.isoformat(),
+                    default=current_date == self.selected_date,
+                )
+            )
+        return options
+
+    def build_timezone_options(self) -> list[discord.SelectOption]:
+        options: list[discord.SelectOption] = []
+        for label, value in PICKER_TIMEZONE_CHOICES:
+            options.append(
+                discord.SelectOption(
+                    label=label,
+                    value=value,
+                    default=value == self.timezone_name,
+                )
+            )
+        return options
+
+    def build_hour_options(self) -> list[discord.SelectOption]:
+        options: list[discord.SelectOption] = []
+        for hour in range(24):
+            options.append(
+                discord.SelectOption(
+                    label=f"{hour:02d}:00",
+                    value=str(hour),
+                    default=hour == self.selected_hour,
+                )
+            )
+        return options
+
+    def build_minute_options(self) -> list[discord.SelectOption]:
+        options: list[discord.SelectOption] = []
+        for minute in (0, 15, 30, 45):
+            options.append(
+                discord.SelectOption(
+                    label=f"{minute:02d}",
+                    value=str(minute),
+                    default=minute == self.selected_minute,
+                )
+            )
+        return options
+
+    def selected_due_at_utc(self) -> datetime:
+        tzinfo = self.resolve_timezone()
+        local_due = datetime(
+            year=self.selected_date.year,
+            month=self.selected_date.month,
+            day=self.selected_date.day,
+            hour=self.selected_hour,
+            minute=self.selected_minute,
+            tzinfo=tzinfo,
+        )
+        return local_due.astimezone(timezone.utc)
+
+    def resolve_timezone(self) -> ZoneInfo:
+        try:
+            return ZoneInfo(self.timezone_name)
+        except ZoneInfoNotFoundError:
+            self.timezone_name = "UTC"
+            return ZoneInfo("UTC")
 
 
 class ReminderCog(commands.GroupCog, group_name="reminder", group_description="Manage your reminders"):
@@ -48,31 +380,29 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
     @app_commands.command(name="add", description="Add a new reminder")
     @app_commands.describe(
         reminder="What should I remind you about?",
-        due="Due datetime (e.g. 2026-04-18 14:00 or 2026-04-18T14:00+02:00)",
     )
-    async def add_reminder(self, interaction: discord.Interaction, reminder: str, due: str) -> None:
+    async def add_reminder(self, interaction: discord.Interaction, reminder: str) -> None:
+        cleaned_reminder = reminder.strip()
+        if not cleaned_reminder:
+            await interaction.response.send_message("Reminder text cannot be empty.", ephemeral=True)
+            return
+        if len(cleaned_reminder) > 200:
+            await interaction.response.send_message(
+                "Reminder text is too long (max 200 characters).",
+                ephemeral=True,
+            )
+            return
+
+        picker_view = ReminderDatePickerView(self, interaction.user.id, cleaned_reminder)
+        await interaction.response.send_message(
+            picker_view.build_prompt_text(),
+            ephemeral=True,
+            view=picker_view,
+        )
         try:
-            due_at = self._parse_due_datetime(due)
-            reminder_item = self.reminder_service.add_reminder(interaction.user.id, reminder, due_at)
-            await interaction.response.send_message(
-                f"Added reminder #{reminder_item.id} due {self._format_timestamp(reminder_item.due_at)}."
-            )
-            await self._send_reminder_list_update(interaction.user, reminder_item)
-            await self._check_due_reminders()
-        except ValueError as error:
-            await interaction.response.send_message(
-                f"I couldn't parse that due date: {error}\n"
-                "Use `YYYY-MM-DD HH:MM` (UTC by default) or include timezone offset.",
-                ephemeral=True,
-            )
-        except ReminderValidationError as error:
-            await interaction.response.send_message(f"I couldn't add that reminder: {error}", ephemeral=True)
-        except ReminderServiceError as error:
-            await self._report_error("ReminderCog.add_reminder", error)
-            await interaction.response.send_message(
-                "Something went wrong while adding your reminder. Please try again.",
-                ephemeral=True,
-            )
+            picker_view.message = await interaction.original_response()
+        except discord.DiscordException:
+            picker_view.message = None
 
     @app_commands.command(name="list", description="List your reminders")
     async def list_reminders(self, interaction: discord.Interaction) -> None:
@@ -422,37 +752,6 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
             return "N/A"
         unix_ts = int(value.timestamp())
         return f"<t:{unix_ts}:R>"
-
-    def _parse_due_datetime(self, due_text: str) -> datetime:
-        if due_text is None:
-            raise ValueError("Due date is required.")
-
-        cleaned = due_text.strip()
-        if not cleaned:
-            raise ValueError("Due date cannot be empty.")
-
-        normalized = cleaned[:-1] + "+00:00" if cleaned.endswith("Z") else cleaned
-
-        parsed: datetime | None = None
-        try:
-            parsed = datetime.fromisoformat(normalized)
-        except ValueError:
-            pass
-
-        if parsed is None:
-            for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
-                try:
-                    parsed = datetime.strptime(cleaned, fmt)
-                    break
-                except ValueError:
-                    continue
-
-        if parsed is None:
-            raise ValueError("Invalid format.")
-
-        if parsed.tzinfo is None:
-            return parsed.replace(tzinfo=timezone.utc)
-        return parsed.astimezone(timezone.utc)
 
     def _find_reminder(self, user_id: int, reminder_id: int) -> ReminderItem | None:
         reminders = self.reminder_service.list_reminders(user_id)
