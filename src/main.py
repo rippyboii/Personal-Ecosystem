@@ -129,6 +129,7 @@ async def setup_hook() -> None:
     loop.set_exception_handler(loop_exception_handler)
 
     await pes.load_extension("cogs.todo")
+    await pes.load_extension("cogs.reminder")
     await pes.tree.sync()
 
 
