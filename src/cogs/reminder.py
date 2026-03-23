@@ -1,4 +1,5 @@
 import re
+import shlex
 from datetime import date, datetime, timedelta, timezone
 from typing import Dict, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -25,6 +26,8 @@ PICKER_TIMEZONE_CHOICES = [
     ("America/New_York", "America/New_York"),
     ("America/Chicago", "America/Chicago"),
     ("America/Los_Angeles", "America/Los_Angeles"),
+    ("Asia/Shanghai", "Asia/Shanghai"),
+    ("Asia/Kathmandu", "Asia/Kathmandu"),
     ("Asia/Singapore", "Asia/Singapore"),
     ("Asia/Tokyo", "Asia/Tokyo"),
     ("Australia/Sydney", "Australia/Sydney"),
@@ -404,6 +407,48 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
         except discord.DiscordException:
             picker_view.message = None
 
+    @app_commands.command(name="quickadd", description="Add a reminder using explicit date and time")
+    @app_commands.describe(
+        reminder="What should I remind you about?",
+        due_date="Date in yyyy/mm/dd (example: 2026/03/30)",
+        due_time="Time in HH:MM 24-hour clock (example: 18:45)",
+        timezone_name="Timezone name (default: UTC, example: Asia/Kathmandu)",
+    )
+    async def quick_add_reminder(
+        self,
+        interaction: discord.Interaction,
+        reminder: str,
+        due_date: str,
+        due_time: str,
+        timezone_name: str = "UTC",
+    ) -> None:
+        cleaned_reminder = reminder.strip()
+        if not cleaned_reminder:
+            await interaction.response.send_message("Reminder text cannot be empty.", ephemeral=True)
+            return
+
+        try:
+            due_at = self._parse_due_datetime_parts(due_date, due_time, timezone_name)
+            reminder_item = self.reminder_service.add_reminder(interaction.user.id, cleaned_reminder, due_at)
+            await self._send_reminder_list_update(interaction.user, reminder_item)
+            await self._check_due_reminders()
+            await interaction.response.send_message(
+                f"Added reminder #{reminder_item.id} due {self._format_timestamp(reminder_item.due_at)}."
+            )
+        except ValueError as error:
+            await interaction.response.send_message(
+                f"{error}\nUse date `yyyy/mm/dd`, time `HH:MM` (24-hour).",
+                ephemeral=True,
+            )
+        except ReminderValidationError as error:
+            await interaction.response.send_message(f"I couldn't add that reminder: {error}", ephemeral=True)
+        except ReminderServiceError as error:
+            await self._report_error("ReminderCog.quick_add_reminder", error)
+            await interaction.response.send_message(
+                "Something went wrong while adding your reminder. Please try again.",
+                ephemeral=True,
+            )
+
     @app_commands.command(name="list", description="List your reminders")
     async def list_reminders(self, interaction: discord.Interaction) -> None:
         try:
@@ -452,6 +497,33 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
                 "Something went wrong while deleting your reminder. Please try again.",
                 ephemeral=True,
             )
+
+    @commands.command(name="reminder")
+    async def add_reminder_legacy(self, ctx: commands.Context, *, args: str | None = None) -> None:
+        if not args:
+            await ctx.send(
+                'Usage: `!reminder "<description>" -d "yyyy/mm/dd" -t "HH:MM"` (24-hour clock, UTC).'
+            )
+            return
+
+        try:
+            reminder_text, due_at = self._parse_legacy_reminder_args(args)
+            reminder_item = self.reminder_service.add_reminder(ctx.author.id, reminder_text, due_at)
+            await self._send_reminder_list_update(ctx.author, reminder_item)
+            await self._check_due_reminders()
+            await ctx.send(
+                f"Added reminder #{reminder_item.id} due {self._format_timestamp(reminder_item.due_at)}."
+            )
+        except ValueError as error:
+            await ctx.send(
+                f"{error}\nUsage: `!reminder \"<description>\" -d \"yyyy/mm/dd\" -t \"HH:MM\"` "
+                "(24-hour clock, UTC)."
+            )
+        except ReminderValidationError as error:
+            await ctx.send(f"I couldn't add that reminder: {error}")
+        except ReminderServiceError as error:
+            await self._report_error("ReminderCog.add_reminder_legacy", error)
+            await ctx.send("Something went wrong while adding your reminder. Please try again.")
 
     @tasks.loop(minutes=5)
     async def reminder_scan_loop(self) -> None:
@@ -759,6 +831,59 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
             if reminder_item.id == reminder_id:
                 return reminder_item
         return None
+
+    def _parse_legacy_reminder_args(self, args: str) -> tuple[str, datetime]:
+        try:
+            tokens = shlex.split(args)
+        except ValueError as error:
+            raise ValueError(f"Could not parse arguments: {error}") from error
+
+        if len(tokens) < 5:
+            raise ValueError("Missing arguments.")
+
+        reminder_text = tokens[0].strip()
+        if not reminder_text:
+            raise ValueError("Reminder description cannot be empty.")
+
+        options: Dict[str, str] = {}
+        index = 1
+        while index < len(tokens):
+            key = tokens[index]
+            if key not in ("-d", "-t"):
+                raise ValueError(f"Unknown option `{key}`.")
+            if index + 1 >= len(tokens):
+                raise ValueError(f"Option `{key}` requires a value.")
+            options[key] = tokens[index + 1]
+            index += 2
+
+        date_text = options.get("-d")
+        time_text = options.get("-t")
+        if not date_text or not time_text:
+            raise ValueError("Both `-d` and `-t` are required.")
+
+        return reminder_text, self._parse_due_datetime_parts(date_text, time_text, "UTC")
+
+    def _parse_due_datetime_parts(self, date_text: str, time_text: str, timezone_name: str = "UTC") -> datetime:
+        if not re.fullmatch(r"\d{4}/\d{2}/\d{2}", date_text):
+            raise ValueError("Date must be in `yyyy/mm/dd` format.")
+        if not re.fullmatch(r"\d{2}:\d{2}", time_text):
+            raise ValueError("Time must be in `HH:MM` 24-hour format.")
+
+        try:
+            naive_due = datetime.strptime(f"{date_text} {time_text}", "%Y/%m/%d %H:%M")
+        except ValueError as error:
+            raise ValueError(f"Invalid date/time: {error}") from error
+
+        tzinfo = self._resolve_timezone_name(timezone_name)
+        due_local = naive_due.replace(tzinfo=tzinfo)
+        return due_local.astimezone(timezone.utc)
+
+    def _resolve_timezone_name(self, timezone_name: str) -> ZoneInfo:
+        cleaned = (timezone_name or "UTC").strip()
+        try:
+            return ZoneInfo(cleaned)
+        except ZoneInfoNotFoundError as error:
+            raise ValueError(f"Unknown timezone `{cleaned}`.") from error
 
     async def _report_error(self, source: str, error: BaseException) -> None:
         reporter = getattr(self.bot, "error_reporter", None)
