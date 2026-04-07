@@ -595,3 +595,4 @@ class TestOnRawReactionAdd:
         await self.cog.on_raw_reaction_add(payload)
         assert self.cog.todo_service.list_todos(1)[0].completed is False
 
+o
