@@ -18,9 +18,11 @@ from services.reminder_service import (
     ReminderValidationError,
 )
 
+WHITE_CHECK_MARK = "\N{WHITE HEAVY CHECK MARK}"
 REMINDER_LIST_COLOR = 0xF59E0B
 REMINDER_DUE_SOON_COLOR = 0xF97316
 REMINDER_DUE_NOW_COLOR = 0xEF4444
+REMINDER_DONE_COLOR = 0x10B981
 REPEAT_CHOICES = [
     app_commands.Choice(name="None (one-time)", value="none"),
     app_commands.Choice(name="Daily", value="daily"),
@@ -440,6 +442,7 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
         self.bot = bot
         self.reminder_service = ReminderService()
         self.reminder_message_by_key: Dict[Tuple[int, int], int] = {}
+        self.reminder_reaction_map: Dict[int, Tuple[int, int]] = {}
         self._state_restored = False
 
     @commands.Cog.listener()
@@ -459,6 +462,38 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
     def cog_unload(self) -> None:
         if self.reminder_scan_loop.is_running():
             self.reminder_scan_loop.cancel()
+
+    @commands.Cog.listener()
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
+        bot_user_id = self.bot.user.id if self.bot.user else None
+        if payload.user_id == bot_user_id:
+            return
+        if str(payload.emoji) != WHITE_CHECK_MARK:
+            return
+
+        mapping = self.reminder_reaction_map.get(payload.message_id)
+        if mapping is None:
+            return
+
+        owner_user_id, reminder_id = mapping
+        if payload.user_id != owner_user_id:
+            return
+
+        ping_channel_id = self._to_int(reminder_channel_id)
+        if ping_channel_id is not None and payload.channel_id != ping_channel_id:
+            return
+
+        self.reminder_reaction_map.pop(payload.message_id, None)
+
+        try:
+            reminder_item = self._find_reminder(owner_user_id, reminder_id)
+            if reminder_item is not None:
+                self.reminder_service.delete_reminder(owner_user_id, reminder_id)
+                await self._mark_reminder_done_in_channel(owner_user_id, reminder_item)
+                self.reminder_message_by_key.pop((owner_user_id, reminder_id), None)
+            await self._delete_message(reminder_channel_id, payload.message_id)
+        except (ReminderServiceError, discord.DiscordException):
+            return
 
     @app_commands.command(name="add", description="Add a new reminder")
     @app_commands.describe(
@@ -711,10 +746,17 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
         )
 
         try:
-            await channel.send(content=content, embed=embed)
-            return True
+            message = await channel.send(content=content, embed=embed)
         except discord.DiscordException:
             return False
+
+        try:
+            await message.add_reaction(WHITE_CHECK_MARK)
+            self.reminder_reaction_map[message.id] = (user_id, reminder_item.id)
+        except discord.DiscordException:
+            pass
+
+        return True
 
     async def _send_due_now_ping(self, user_id: int, reminder_item: ReminderItem) -> bool:
         channel = await self._resolve_channel(reminder_channel_id)
@@ -729,10 +771,17 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
         )
 
         try:
-            await channel.send(content=content, embed=embed)
-            return True
+            message = await channel.send(content=content, embed=embed)
         except discord.DiscordException:
             return False
+
+        try:
+            await message.add_reaction(WHITE_CHECK_MARK)
+            self.reminder_reaction_map[message.id] = (user_id, reminder_item.id)
+        except discord.DiscordException:
+            pass
+
+        return True
 
     async def _send_reminder_list_update(
         self, user: discord.User | discord.Member, reminder_item: ReminderItem
@@ -795,6 +844,7 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
     async def _restore_state_from_channel(self) -> None:
         self.reminder_service.reset()
         self.reminder_message_by_key.clear()
+        self.reminder_reaction_map.clear()
 
         list_channel = await self._resolve_channel(reminder_list_channel_id)
         if list_channel is None or not hasattr(list_channel, "history"):
@@ -845,6 +895,9 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
             return None
 
         embed = message.embeds[0]
+        if self._embed_field_value(embed, "Done At") is not None:
+            return None
+
         reminder_id = self._extract_reminder_id(embed.title)
         if reminder_id is None:
             return None
@@ -998,6 +1051,51 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
         embed.add_field(name="Reminder", value=self._format_reminder_body(reminder_item.reminder), inline=False)
         embed.set_footer(text="This reminder is now due.")
         return embed
+
+    async def _mark_reminder_done_in_channel(self, user_id: int, reminder_item: ReminderItem) -> None:
+        key = (user_id, reminder_item.id)
+        message_id = self.reminder_message_by_key.get(key)
+        if message_id is None:
+            return
+
+        channel = await self._resolve_channel(reminder_list_channel_id)
+        if channel is None or not hasattr(channel, "fetch_message"):
+            return
+
+        try:
+            message = await channel.fetch_message(message_id)
+            embed = self._build_done_reminder_embed(user_id, reminder_item)
+            focus_text = self._build_focus_heading(reminder_item.reminder, "✅")
+            await message.edit(content=focus_text, embed=embed)
+        except discord.DiscordException:
+            return
+
+    def _build_done_reminder_embed(self, user_id: int, reminder_item: ReminderItem) -> discord.Embed:
+        embed = discord.Embed(
+            title=f"Reminder #{reminder_item.id}",
+            color=REMINDER_DONE_COLOR,
+        )
+        embed.add_field(name="Owner", value=f"<@{user_id}>", inline=True)
+        embed.add_field(
+            name="Due",
+            value=f"{self._format_timestamp(reminder_item.due_at)} ({self._format_relative_timestamp(reminder_item.due_at)})",
+            inline=True,
+        )
+        embed.add_field(name="Status", value="Done", inline=True)
+        embed.add_field(name="Created", value=self._format_timestamp(reminder_item.created_at), inline=True)
+        embed.add_field(name="Repeat", value=reminder_item.repeat, inline=True)
+        embed.add_field(name="Done At", value=self._format_timestamp(datetime.now(timezone.utc)), inline=True)
+        embed.add_field(name="Reminder", value=self._format_reminder_body(reminder_item.reminder), inline=False)
+        embed.set_footer(text="This reminder has been marked as done.")
+        return embed
+
+    def _to_int(self, value: str | None) -> int | None:
+        if not value:
+            return None
+        try:
+            return int(value)
+        except ValueError:
+            return None
 
     def _build_focus_heading(self, reminder_text: str, icon: str) -> str:
         single_line = " ".join(reminder_text.splitlines()).strip()
