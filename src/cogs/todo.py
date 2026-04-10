@@ -41,10 +41,10 @@ class TodoCog(commands.GroupCog, group_name="todo", group_description="Manage yo
             self._state_restored = False
 
     @app_commands.command(name="add", description="Add a new todo item")
-    @app_commands.describe(task="The task you want to add")
-    async def add_todo(self, interaction: discord.Interaction, task: str) -> None:
+    @app_commands.describe(task="The task you want to add", description="Optional details about the task")
+    async def add_todo(self, interaction: discord.Interaction, task: str, description: str | None = None) -> None:
         try:
-            todo = self.todo_service.add_todo(interaction.user.id, task)
+            todo = self.todo_service.add_todo(interaction.user.id, task, description)
             await interaction.response.send_message(f"Added todo #{todo.id}: {todo.task}")
             await self._send_todo_list_update(interaction, todo)
         except TodoValidationError as error:
@@ -127,7 +127,7 @@ class TodoCog(commands.GroupCog, group_name="todo", group_description="Manage yo
         try:
             embed = self._build_todo_list_embed(interaction.user, todo)
             focus_text = self._build_focus_heading(todo.task, "📝")
-            message = await channel.send(content=focus_text, embed=embed)
+            message = await channel.send(content=f"<@{interaction.user.id}>\n{focus_text}", embed=embed)
             await message.add_reaction(WHITE_CHECK_MARK)
             self.todo_message_map[message.id] = (interaction.user.id, todo.id)
             self.todo_list_message_by_key[(interaction.user.id, todo.id)] = message.id
@@ -212,26 +212,25 @@ class TodoCog(commands.GroupCog, group_name="todo", group_description="Manage yo
     def _build_todo_list_embed(self, user: discord.User | discord.Member, todo: TodoItem) -> discord.Embed:
         embed = discord.Embed(
             title=f"Task #{todo.id}",
+            description=todo.task,
             color=TODO_LIST_COLOR,
         )
-        embed.set_author(name=f"{user.display_name} added a new todo", icon_url=user.display_avatar.url)
-        embed.add_field(name="Owner", value=f"<@{user.id}>", inline=True)
-        embed.add_field(name="Status", value="Pending", inline=True)
-        embed.add_field(name="Created", value=self._format_timestamp(todo.created_at), inline=False)
-        embed.add_field(name="Task", value=self._format_task_body(todo.task), inline=False)
-        embed.set_footer(text="React with ✅ to complete this task")
+        if todo.description:
+            embed.add_field(name="", value=f"*{todo.description}*", inline=False)
+        embed.set_footer(text="React ✅ to complete")
         return embed
 
     def _build_todo_completed_embed(self, user_id: int, todo: TodoItem, completed_text: str) -> discord.Embed:
         embed = discord.Embed(
-            title=f"Completed Task #{todo.id}",
+            title=f"Task #{todo.id}",
+            description=todo.task,
             color=TODO_COMPLETED_COLOR,
         )
-        embed.add_field(name="Owner", value=f"<@{user_id}>", inline=True)
+        if todo.description:
+            embed.add_field(name="", value=f"*{todo.description}*", inline=False)
         embed.add_field(name="Created", value=self._format_timestamp(todo.created_at), inline=True)
         embed.add_field(name="Completed", value=completed_text, inline=True)
-        embed.add_field(name="Task", value=self._format_task_body(todo.task), inline=False)
-        embed.set_footer(text="Great progress")
+        embed.set_footer(text="Completed")
         return embed
 
     def _build_focus_heading(self, task: str, icon: str) -> str:

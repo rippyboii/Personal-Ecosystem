@@ -22,6 +22,7 @@ class TodoItem:
     completed: bool = False
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     completed_at: datetime | None = None
+    description: str | None = None
 
 
 class TodoService:
@@ -29,12 +30,14 @@ class TodoService:
         self._todos_by_user: Dict[int, List[TodoItem]] = {}
         self._next_id_by_user: Dict[int, int] = {}
 
-    def add_todo(self, user_id: int, task: str) -> TodoItem:
+    def add_todo(self, user_id: int, task: str, description: str | None = None) -> TodoItem:
         cleaned_task = self._validate_task(task)
+        cleaned_description = self._validate_description(description)
         todo = TodoItem(
             id=self._next_id(user_id),
             task=cleaned_task,
             created_at=datetime.now(timezone.utc),
+            description=cleaned_description,
         )
         self._todos_by_user.setdefault(user_id, []).append(todo)
         return todo
@@ -89,6 +92,16 @@ class TodoService:
             raise TodoValidationError("Task cannot be empty.")
         if len(cleaned) > 200:
             raise TodoValidationError("Task is too long (max 200 characters).")
+        return cleaned
+
+    def _validate_description(self, description: str | None) -> str | None:
+        if description is None:
+            return None
+        cleaned = description.strip()
+        if not cleaned:
+            return None
+        if len(cleaned) > 500:
+            raise TodoValidationError("Description is too long (max 500 characters).")
         return cleaned
 
     def _next_id(self, user_id: int) -> int:
