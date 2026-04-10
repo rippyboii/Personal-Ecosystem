@@ -21,6 +21,13 @@ from services.reminder_service import (
 REMINDER_LIST_COLOR = 0xF59E0B
 REMINDER_DUE_SOON_COLOR = 0xF97316
 REMINDER_DUE_NOW_COLOR = 0xEF4444
+REPEAT_CHOICES = [
+    app_commands.Choice(name="None (one-time)", value="none"),
+    app_commands.Choice(name="Daily", value="daily"),
+    app_commands.Choice(name="Weekly", value="weekly"),
+    app_commands.Choice(name="Monthly", value="monthly"),
+    app_commands.Choice(name="Yearly", value="yearly"),
+]
 PICKER_TIMEZONE_CHOICES = [
     ("UTC", "UTC"),
     ("Europe/Stockholm", "Europe/Stockholm"),
@@ -135,6 +142,7 @@ class ReminderCreateButton(discord.ui.Button):
                 interaction.user.id,
                 self.picker_view.reminder_text,
                 due_at,
+                self.picker_view.repeat,
             )
             await self.picker_view.cog._send_reminder_list_update(interaction.user, reminder_item)
             await self.picker_view.cog._check_due_reminders()
@@ -169,24 +177,89 @@ class ReminderCancelButton(discord.ui.Button):
         await interaction.response.edit_message(content="Reminder creation cancelled.", view=None)
 
 
+class ReminderSaveButton(discord.ui.Button):
+    def __init__(self, picker_view: "ReminderDatePickerView") -> None:
+        self.picker_view = picker_view
+        super().__init__(label="Save Changes", style=discord.ButtonStyle.success, row=4)
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        due_at = self.picker_view.selected_due_at_utc()
+        if due_at <= datetime.now(timezone.utc):
+            await self.picker_view.refresh_message(interaction, "Selected due time must be in the future.")
+            return
+
+        try:
+            reminder_item = self.picker_view.cog.reminder_service.update_reminder(
+                interaction.user.id,
+                self.picker_view.edit_reminder_id,
+                reminder_text=self.picker_view.reminder_text,
+                due_at=due_at,
+                repeat=self.picker_view.repeat,
+            )
+            await self.picker_view.cog._refresh_reminder_list_message(interaction.user.id, reminder_item.id)
+            await self.picker_view.cog._check_due_reminders()
+        except ReminderNotFoundError:
+            await self.picker_view.refresh_message(
+                interaction, f"I couldn't find reminder #{self.picker_view.edit_reminder_id}."
+            )
+            return
+        except ReminderValidationError as error:
+            await self.picker_view.refresh_message(interaction, f"I couldn't update that reminder: {error}")
+            return
+        except ReminderServiceError as error:
+            await self.picker_view.cog._report_error("ReminderSaveButton.callback", error)
+            await self.picker_view.refresh_message(
+                interaction,
+                "Something went wrong while updating your reminder. Please try again.",
+            )
+            return
+
+        self.picker_view.stop()
+        await interaction.response.edit_message(
+            content=(
+                f"Updated reminder #{reminder_item.id} due "
+                f"{self.picker_view.cog._format_timestamp(reminder_item.due_at)}."
+            ),
+            view=None,
+        )
+
+
 class ReminderDatePickerView(discord.ui.View):
     DATE_PAGE_SIZE = 25
 
-    def __init__(self, cog: "ReminderCog", requester_id: int, reminder_text: str) -> None:
+    def __init__(
+        self,
+        cog: "ReminderCog",
+        requester_id: int,
+        reminder_text: str,
+        repeat: str = "none",
+        prefill_due_at: datetime | None = None,
+        edit_reminder_id: int | None = None,
+    ) -> None:
         super().__init__(timeout=900)
         self.cog = cog
         self.requester_id = requester_id
         self.reminder_text = reminder_text
+        self.repeat = repeat
+        self.edit_reminder_id = edit_reminder_id
 
-        suggested_due = (datetime.now(timezone.utc) + timedelta(hours=1)).replace(
-            minute=0,
-            second=0,
-            microsecond=0,
-        )
-        self.selected_date = suggested_due.date()
-        self.selected_hour = suggested_due.hour
-        self.selected_minute = 0
-        self.timezone_name = "UTC"
+        if prefill_due_at is not None:
+            prefill_utc = prefill_due_at.astimezone(timezone.utc)
+            self.selected_date = prefill_utc.date()
+            self.selected_hour = prefill_utc.hour
+            self.selected_minute = min([0, 15, 30, 45], key=lambda m: abs(m - prefill_utc.minute))
+            self.timezone_name = "UTC"
+        else:
+            suggested_due = (datetime.now(timezone.utc) + timedelta(hours=1)).replace(
+                minute=0,
+                second=0,
+                microsecond=0,
+            )
+            self.selected_date = suggested_due.date()
+            self.selected_hour = suggested_due.hour
+            self.selected_minute = 0
+            self.timezone_name = "UTC"
+
         self.date_page_start = self.selected_date
         self.message: discord.Message | None = None
 
@@ -196,7 +269,7 @@ class ReminderDatePickerView(discord.ui.View):
         self.minute_select = ReminderMinuteSelect(self)
         self.previous_dates_button = ReminderPreviousDatesButton(self)
         self.next_dates_button = ReminderNextDatesButton(self)
-        self.create_button = ReminderCreateButton(self)
+        self.action_button = ReminderSaveButton(self) if edit_reminder_id is not None else ReminderCreateButton(self)
         self.cancel_button = ReminderCancelButton(self)
 
         self.add_item(self.date_select)
@@ -205,7 +278,7 @@ class ReminderDatePickerView(discord.ui.View):
         self.add_item(self.minute_select)
         self.add_item(self.previous_dates_button)
         self.add_item(self.next_dates_button)
-        self.add_item(self.create_button)
+        self.add_item(self.action_button)
         self.add_item(self.cancel_button)
 
         self.sync_component_state()
@@ -224,9 +297,10 @@ class ReminderDatePickerView(discord.ui.View):
             child.disabled = True
         if self.message is None:
             return
+        retry_cmd = "/reminder edit" if self.edit_reminder_id is not None else "/reminder add"
         try:
             await self.message.edit(
-                content="Reminder setup timed out. Run `/reminder add` again.",
+                content=f"Reminder setup timed out. Run `{retry_cmd}` again.",
                 view=self,
             )
         except discord.DiscordException:
@@ -264,7 +338,7 @@ class ReminderDatePickerView(discord.ui.View):
         self.minute_select.options = self.build_minute_options()
 
         self.previous_dates_button.disabled = self.date_page_start <= minimum_date
-        self.create_button.disabled = self.selected_due_at_utc() <= datetime.now(timezone.utc)
+        self.action_button.disabled = self.selected_due_at_utc() <= datetime.now(timezone.utc)
 
     async def refresh_message(self, interaction: discord.Interaction, notice: str | None = None) -> None:
         self.sync_component_state()
@@ -274,12 +348,17 @@ class ReminderDatePickerView(discord.ui.View):
         due_at = self.selected_due_at_utc()
         window_end = self.date_page_start + timedelta(days=self.DATE_PAGE_SIZE - 1)
 
+        if self.edit_reminder_id is not None:
+            heading = f"Editing reminder #{self.edit_reminder_id}. Adjust the due date and time below."
+        else:
+            heading = "Use the picker below to set reminder due date and time."
         lines = [
-            "Use the picker below to set reminder due date and time.",
+            heading,
             f"Reminder: {self.reminder_text}",
             f"Selected due: {self.cog._format_timestamp(due_at)} ({self.cog._format_relative_timestamp(due_at)})",
             f"Timezone: `{self.timezone_name}`",
             f"Date window: `{self.date_page_start.isoformat()}` to `{window_end.isoformat()}`",
+            f"Repeat: `{self.repeat}`",
         ]
         if due_at <= datetime.now(timezone.utc):
             lines.append("Selected due time must be in the future.")
@@ -384,8 +463,10 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
     @app_commands.command(name="add", description="Add a new reminder")
     @app_commands.describe(
         reminder="What should I remind you about?",
+        repeat="How often to repeat (default: none)",
     )
-    async def add_reminder(self, interaction: discord.Interaction, reminder: str) -> None:
+    @app_commands.choices(repeat=REPEAT_CHOICES)
+    async def add_reminder(self, interaction: discord.Interaction, reminder: str, repeat: str = "none") -> None:
         cleaned_reminder = reminder.strip()
         if not cleaned_reminder:
             await interaction.response.send_message("Reminder text cannot be empty.", ephemeral=True)
@@ -397,7 +478,7 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
             )
             return
 
-        picker_view = ReminderDatePickerView(self, interaction.user.id, cleaned_reminder)
+        picker_view = ReminderDatePickerView(self, interaction.user.id, cleaned_reminder, repeat)
         await interaction.response.send_message(
             picker_view.build_prompt_text(),
             ephemeral=True,
@@ -414,7 +495,9 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
         due_date="Date in yyyy/mm/dd (example: 2026/03/30)",
         due_time="Time in HH:MM 24-hour clock (example: 18:45)",
         timezone_name="Timezone name (default: UTC, example: Asia/Kathmandu)",
+        repeat="How often to repeat (default: none)",
     )
+    @app_commands.choices(repeat=REPEAT_CHOICES)
     async def quick_add_reminder(
         self,
         interaction: discord.Interaction,
@@ -422,6 +505,7 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
         due_date: str,
         due_time: str,
         timezone_name: str = "UTC",
+        repeat: str = "none",
     ) -> None:
         cleaned_reminder = reminder.strip()
         if not cleaned_reminder:
@@ -430,7 +514,7 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
 
         try:
             due_at = self._parse_due_datetime_parts(due_date, due_time, timezone_name)
-            reminder_item = self.reminder_service.add_reminder(interaction.user.id, cleaned_reminder, due_at)
+            reminder_item = self.reminder_service.add_reminder(interaction.user.id, cleaned_reminder, due_at, repeat)
             await self._send_reminder_list_update(interaction.user, reminder_item)
             await self._check_due_reminders()
             await interaction.response.send_message(
@@ -463,10 +547,16 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
             reminders = sorted(reminders, key=lambda reminder_item: reminder_item.due_at)
             lines = []
             for reminder_item in reminders:
-                status = "24h ping sent" if reminder_item.reminded_24h_at else "pending"
+                if reminder_item.fired_at:
+                    status = "fired"
+                elif reminder_item.reminded_24h_at:
+                    status = "24h ping sent"
+                else:
+                    status = "pending"
+                repeat_tag = f" [{reminder_item.repeat}]" if reminder_item.repeat != "none" else ""
                 lines.append(
                     f"#{reminder_item.id} {self._format_timestamp(reminder_item.due_at)} "
-                    f"({self._format_relative_timestamp(reminder_item.due_at)}) [{status}] - "
+                    f"({self._format_relative_timestamp(reminder_item.due_at)}) [{status}]{repeat_tag} - "
                     f"{reminder_item.reminder}"
                 )
 
@@ -499,17 +589,61 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
                 ephemeral=True,
             )
 
+    @app_commands.command(name="edit", description="Edit an existing reminder")
+    @app_commands.describe(
+        reminder_id="The reminder ID to edit",
+        reminder="New reminder text (leave blank to keep existing)",
+        repeat="New repeat setting (leave blank to keep existing)",
+    )
+    @app_commands.choices(repeat=REPEAT_CHOICES)
+    async def edit_reminder(
+        self,
+        interaction: discord.Interaction,
+        reminder_id: int,
+        reminder: str | None = None,
+        repeat: str | None = None,
+    ) -> None:
+        existing = self._find_reminder(interaction.user.id, reminder_id)
+        if existing is None:
+            await interaction.response.send_message(
+                f"I couldn't find reminder #{reminder_id}. Use `/reminder list` to check IDs.",
+                ephemeral=True,
+            )
+            return
+
+        new_text = reminder.strip() if reminder else existing.reminder
+        new_repeat = repeat if repeat is not None else existing.repeat
+
+        picker_view = ReminderDatePickerView(
+            self,
+            interaction.user.id,
+            new_text,
+            new_repeat,
+            prefill_due_at=existing.due_at,
+            edit_reminder_id=reminder_id,
+        )
+        await interaction.response.send_message(
+            picker_view.build_prompt_text(),
+            ephemeral=True,
+            view=picker_view,
+        )
+        try:
+            picker_view.message = await interaction.original_response()
+        except discord.DiscordException:
+            picker_view.message = None
+
     @commands.command(name="reminder")
     async def add_reminder_legacy(self, ctx: commands.Context, *, args: str | None = None) -> None:
         if not args:
             await ctx.send(
-                'Usage: `!reminder "<description>" -d "yyyy/mm/dd" -t "HH:MM"` (24-hour clock, UTC).'
+                'Usage: `!reminder "<description>" -d "yyyy/mm/dd" -t "HH:MM" [-r none|daily|weekly|monthly|yearly]`'
+                " (24-hour clock, UTC)."
             )
             return
 
         try:
-            reminder_text, due_at = self._parse_legacy_reminder_args(args)
-            reminder_item = self.reminder_service.add_reminder(ctx.author.id, reminder_text, due_at)
+            reminder_text, due_at, repeat = self._parse_legacy_reminder_args(args)
+            reminder_item = self.reminder_service.add_reminder(ctx.author.id, reminder_text, due_at, repeat)
             await self._send_reminder_list_update(ctx.author, reminder_item)
             await self._check_due_reminders()
             await ctx.send(
@@ -517,8 +651,8 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
             )
         except ValueError as error:
             await ctx.send(
-                f"{error}\nUsage: `!reminder \"<description>\" -d \"yyyy/mm/dd\" -t \"HH:MM\"` "
-                "(24-hour clock, UTC)."
+                f"{error}\nUsage: `!reminder \"<description>\" -d \"yyyy/mm/dd\" -t \"HH:MM\""
+                " [-r none|daily|weekly|monthly|yearly]` (24-hour clock, UTC)."
             )
         except ReminderValidationError as error:
             await ctx.send(f"I couldn't add that reminder: {error}")
@@ -554,7 +688,10 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
                 sent = await self._send_due_now_ping(user_id, reminder_item)
                 if not sent:
                     continue
-                self.reminder_service.mark_fired(user_id, reminder_item.id)
+                if reminder_item.repeat != "none":
+                    self.reminder_service.reschedule_reminder(user_id, reminder_item.id)
+                else:
+                    self.reminder_service.mark_fired(user_id, reminder_item.id)
                 await self._refresh_reminder_list_message(user_id, reminder_item.id)
             except ReminderServiceError as error:
                 await self._report_error("ReminderCog._check_due_reminders", error)
@@ -668,7 +805,7 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
             if parsed is None:
                 continue
 
-            user_id, reminder_id, reminder_text, due_at, created_at, reminded_24h_at, fired_at = parsed
+            user_id, reminder_id, reminder_text, due_at, created_at, reminded_24h_at, fired_at, repeat = parsed
             reminder_item = ReminderItem(
                 id=reminder_id,
                 reminder=reminder_text,
@@ -676,6 +813,7 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
                 created_at=created_at,
                 reminded_24h_at=reminded_24h_at,
                 fired_at=fired_at,
+                repeat=repeat,
             )
             self.reminder_service.load_reminder(user_id, reminder_item)
             self.reminder_message_by_key[(user_id, reminder_id)] = message.id
@@ -702,7 +840,7 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
 
     def _parse_reminder_list_message(
         self, message: discord.Message
-    ) -> tuple[int, int, str, datetime, datetime, datetime | None, datetime | None] | None:
+    ) -> tuple[int, int, str, datetime, datetime, datetime | None, datetime | None, str] | None:
         if not message.embeds:
             return None
 
@@ -728,6 +866,7 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
         created_at = self._extract_field_timestamp(embed, "Created") or message.created_at
         reminded_24h_at = self._extract_field_timestamp(embed, "24h Reminder Sent")
         fired_at = self._extract_field_timestamp(embed, "Due Ping Sent")
+        repeat = self._embed_field_value(embed, "Repeat") or "none"
         return (
             user_id,
             reminder_id,
@@ -736,6 +875,7 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
             created_at.astimezone(timezone.utc),
             reminded_24h_at.astimezone(timezone.utc) if reminded_24h_at else None,
             fired_at.astimezone(timezone.utc) if fired_at else None,
+            repeat,
         )
 
     def _extract_reminder_id(self, title: str | None) -> int | None:
@@ -824,6 +964,7 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
         embed.add_field(name="Created", value=self._format_timestamp(reminder_item.created_at), inline=True)
         embed.add_field(name="24h Reminder Sent", value=self._format_timestamp(reminder_item.reminded_24h_at), inline=True)
         embed.add_field(name="Due Ping Sent", value=self._format_timestamp(reminder_item.fired_at), inline=True)
+        embed.add_field(name="Repeat", value=reminder_item.repeat, inline=True)
         embed.add_field(name="Reminder", value=self._format_reminder_body(reminder_item.reminder), inline=False)
         embed.set_footer(text="Stored in reminders list channel for persistence")
         return embed
@@ -888,7 +1029,7 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
                 return reminder_item
         return None
 
-    def _parse_legacy_reminder_args(self, args: str) -> tuple[str, datetime]:
+    def _parse_legacy_reminder_args(self, args: str) -> tuple[str, datetime, str]:
         try:
             tokens = shlex.split(args)
         except ValueError as error:
@@ -905,7 +1046,7 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
         index = 1
         while index < len(tokens):
             key = tokens[index]
-            if key not in ("-d", "-t"):
+            if key not in ("-d", "-t", "-r"):
                 raise ValueError(f"Unknown option `{key}`.")
             if index + 1 >= len(tokens):
                 raise ValueError(f"Option `{key}` requires a value.")
@@ -917,7 +1058,8 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
         if not date_text or not time_text:
             raise ValueError("Both `-d` and `-t` are required.")
 
-        return reminder_text, self._parse_due_datetime_parts(date_text, time_text, "UTC")
+        repeat = options.get("-r", "none")
+        return reminder_text, self._parse_due_datetime_parts(date_text, time_text, "UTC"), repeat
 
     def _parse_due_datetime_parts(self, date_text: str, time_text: str, timezone_name: str = "UTC") -> datetime:
         if not re.fullmatch(r"\d{4}/\d{2}/\d{2}", date_text):

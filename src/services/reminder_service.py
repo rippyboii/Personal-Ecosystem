@@ -1,6 +1,9 @@
+from calendar import monthrange
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Tuple
+
+VALID_REPEAT_VALUES = {"none", "daily", "weekly", "monthly", "yearly"}
 
 
 class ReminderServiceError(Exception):
@@ -23,6 +26,7 @@ class ReminderItem:
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     reminded_24h_at: datetime | None = None
     fired_at: datetime | None = None
+    repeat: str = "none"
 
 
 class ReminderService:
@@ -30,15 +34,19 @@ class ReminderService:
         self._reminders_by_user: Dict[int, List[ReminderItem]] = {}
         self._next_id_by_user: Dict[int, int] = {}
 
-    def add_reminder(self, user_id: int, reminder_text: str, due_at: datetime) -> ReminderItem:
+    def add_reminder(
+        self, user_id: int, reminder_text: str, due_at: datetime, repeat: str = "none"
+    ) -> ReminderItem:
         cleaned_text = self._validate_reminder_text(reminder_text)
         normalized_due_at = self._validate_due_at(due_at)
+        cleaned_repeat = self._validate_repeat(repeat)
 
         reminder = ReminderItem(
             id=self._next_id(user_id),
             reminder=cleaned_text,
             due_at=normalized_due_at,
             created_at=datetime.now(timezone.utc),
+            repeat=cleaned_repeat,
         )
         self._reminders_by_user.setdefault(user_id, []).append(reminder)
         return reminder
@@ -125,6 +133,73 @@ class ReminderService:
 
         due_reminders.sort(key=lambda item: item[1].due_at)
         return due_reminders
+
+    def update_reminder(
+        self,
+        user_id: int,
+        reminder_id: int,
+        reminder_text: str | None = None,
+        due_at: datetime | None = None,
+        repeat: str | None = None,
+    ) -> ReminderItem:
+        reminder = self._get_reminder_by_id(user_id, reminder_id)
+
+        if reminder_text is not None:
+            reminder.reminder = self._validate_reminder_text(reminder_text)
+
+        if due_at is not None:
+            normalized = due_at.astimezone(timezone.utc) if due_at.tzinfo else due_at.replace(tzinfo=timezone.utc)
+            if normalized <= datetime.now(timezone.utc):
+                raise ReminderValidationError("Due date must be in the future.")
+            if normalized != reminder.due_at:
+                reminder.reminded_24h_at = None
+                reminder.fired_at = None
+            reminder.due_at = normalized
+
+        if repeat is not None:
+            reminder.repeat = self._validate_repeat(repeat)
+
+        return reminder
+
+    def reschedule_reminder(self, user_id: int, reminder_id: int) -> ReminderItem:
+        reminder = self._get_reminder_by_id(user_id, reminder_id)
+        reminder.due_at = self._next_due_at(reminder.due_at, reminder.repeat)
+        reminder.reminded_24h_at = None
+        reminder.fired_at = None
+        return reminder
+
+    def _next_due_at(self, due_at: datetime, repeat: str) -> datetime:
+        if repeat == "daily":
+            return due_at + timedelta(days=1)
+        if repeat == "weekly":
+            return due_at + timedelta(weeks=1)
+        if repeat == "monthly":
+            return self._advance_monthly(due_at)
+        if repeat == "yearly":
+            return self._advance_yearly(due_at)
+        raise ReminderServiceError(f"Cannot reschedule a reminder with repeat='{repeat}'.")
+
+    def _advance_yearly(self, dt: datetime) -> datetime:
+        year = dt.year + 1
+        max_day = monthrange(year, dt.month)[1]
+        return dt.replace(year=year, day=min(dt.day, max_day))
+
+    def _advance_monthly(self, dt: datetime) -> datetime:
+        month = dt.month + 1
+        year = dt.year
+        if month > 12:
+            month = 1
+            year += 1
+        max_day = monthrange(year, month)[1]
+        return dt.replace(year=year, month=month, day=min(dt.day, max_day))
+
+    def _validate_repeat(self, repeat: str) -> str:
+        cleaned = (repeat or "none").strip().lower()
+        if cleaned not in VALID_REPEAT_VALUES:
+            raise ReminderValidationError(
+                f"Invalid repeat value '{repeat}'. Must be one of: none, daily, weekly, monthly."
+            )
+        return cleaned
 
     def _validate_reminder_text(self, reminder_text: str) -> str:
         if reminder_text is None:
