@@ -491,8 +491,9 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
                 if reminder_item is not None:
                     self.reminder_service.delete_reminder(owner_user_id, reminder_id)
                     await self._mark_reminder_done_in_channel(owner_user_id, reminder_item)
-                    self.reminder_message_by_key.pop((owner_user_id, reminder_id), None)
-                    self.reminder_cross_reaction_map.pop(payload.message_id, None)
+                    list_msg_id = self.reminder_message_by_key.pop((owner_user_id, reminder_id), None)
+                    if list_msg_id is not None:
+                        self.reminder_cross_reaction_map.pop(list_msg_id, None)
                 await self._delete_message(reminder_channel_id, payload.message_id)
             except (ReminderServiceError, discord.DiscordException):
                 return
@@ -954,7 +955,13 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
         reminded_24h_at = self._extract_field_timestamp(embed, "24h Reminder Sent")
         fired_at = self._extract_field_timestamp(embed, "Due Ping Sent")
         repeat_raw = self._embed_field_value(embed, "Repeat") or "none"
-        repeat = re.sub(r"\s*\((?:ON|OFF)\)\s*$", "", repeat_raw).strip() or "none"
+        if repeat_raw.endswith(" (OFF)"):
+            # Reminder is paused — actual repeat is "none"; paused schedule is in Paused Repeat field
+            repeat = "none"
+        elif repeat_raw.endswith(" (ON)"):
+            repeat = re.sub(r"\s*\(ON\)\s*$", "", repeat_raw).strip() or "none"
+        else:
+            repeat = repeat_raw  # backward compat with embeds written before the ON/OFF suffix
         paused_repeat_str = self._embed_field_value(embed, "Paused Repeat") or "none"
         paused_repeat = None if paused_repeat_str == "none" else paused_repeat_str
         return (
