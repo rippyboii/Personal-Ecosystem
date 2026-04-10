@@ -27,6 +27,7 @@ class ReminderItem:
     reminded_24h_at: datetime | None = None
     fired_at: datetime | None = None
     repeat: str = "none"
+    paused_repeat: str | None = None
 
 
 class ReminderService:
@@ -166,6 +167,20 @@ class ReminderService:
         reminder.due_at = self._next_due_at(reminder.due_at, reminder.repeat)
         reminder.reminded_24h_at = None
         reminder.fired_at = None
+        return reminder
+
+    def toggle_recurring(self, user_id: int, reminder_id: int) -> ReminderItem:
+        reminder = self._get_reminder_by_id(user_id, reminder_id)
+        if reminder.repeat != "none":
+            reminder.paused_repeat = reminder.repeat
+            reminder.repeat = "none"
+        elif reminder.paused_repeat is not None:
+            reminder.repeat = reminder.paused_repeat
+            reminder.paused_repeat = None
+            if reminder.fired_at is not None:
+                reminder.due_at = self._next_due_at(reminder.due_at, reminder.repeat)
+                reminder.reminded_24h_at = None
+                reminder.fired_at = None
         return reminder
 
     def _next_due_at(self, due_at: datetime, repeat: str) -> datetime:

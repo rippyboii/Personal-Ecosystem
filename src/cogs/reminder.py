@@ -19,6 +19,7 @@ from services.reminder_service import (
 )
 
 WHITE_CHECK_MARK = "\N{WHITE HEAVY CHECK MARK}"
+CROSS_MARK = "\N{CROSS MARK}"
 REMINDER_LIST_COLOR = 0xF59E0B
 REMINDER_DUE_SOON_COLOR = 0xF97316
 REMINDER_DUE_NOW_COLOR = 0xEF4444
@@ -443,6 +444,7 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
         self.reminder_service = ReminderService()
         self.reminder_message_by_key: Dict[Tuple[int, int], int] = {}
         self.reminder_reaction_map: Dict[int, Tuple[int, int]] = {}
+        self.reminder_cross_reaction_map: Dict[int, Tuple[int, int]] = {}
         self._state_restored = False
 
     @commands.Cog.listener()
@@ -468,32 +470,51 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
         bot_user_id = self.bot.user.id if self.bot.user else None
         if payload.user_id == bot_user_id:
             return
-        if str(payload.emoji) != WHITE_CHECK_MARK:
+
+        emoji = str(payload.emoji)
+        if emoji not in (WHITE_CHECK_MARK, CROSS_MARK):
             return
 
-        mapping = self.reminder_reaction_map.get(payload.message_id)
-        if mapping is None:
-            return
+        if emoji == WHITE_CHECK_MARK:
+            mapping = self.reminder_reaction_map.get(payload.message_id)
+            if mapping is None:
+                return
+            owner_user_id, reminder_id = mapping
+            if payload.user_id != owner_user_id:
+                return
+            ping_channel_id = self._to_int(reminder_channel_id)
+            if ping_channel_id is not None and payload.channel_id != ping_channel_id:
+                return
+            self.reminder_reaction_map.pop(payload.message_id, None)
+            try:
+                reminder_item = self._find_reminder(owner_user_id, reminder_id)
+                if reminder_item is not None:
+                    self.reminder_service.delete_reminder(owner_user_id, reminder_id)
+                    await self._mark_reminder_done_in_channel(owner_user_id, reminder_item)
+                    self.reminder_message_by_key.pop((owner_user_id, reminder_id), None)
+                    self.reminder_cross_reaction_map.pop(payload.message_id, None)
+                await self._delete_message(reminder_channel_id, payload.message_id)
+            except (ReminderServiceError, discord.DiscordException):
+                return
 
-        owner_user_id, reminder_id = mapping
-        if payload.user_id != owner_user_id:
-            return
-
-        ping_channel_id = self._to_int(reminder_channel_id)
-        if ping_channel_id is not None and payload.channel_id != ping_channel_id:
-            return
-
-        self.reminder_reaction_map.pop(payload.message_id, None)
-
-        try:
-            reminder_item = self._find_reminder(owner_user_id, reminder_id)
-            if reminder_item is not None:
-                self.reminder_service.delete_reminder(owner_user_id, reminder_id)
-                await self._mark_reminder_done_in_channel(owner_user_id, reminder_item)
-                self.reminder_message_by_key.pop((owner_user_id, reminder_id), None)
-            await self._delete_message(reminder_channel_id, payload.message_id)
-        except (ReminderServiceError, discord.DiscordException):
-            return
+        elif emoji == CROSS_MARK:
+            mapping = self.reminder_cross_reaction_map.get(payload.message_id)
+            if mapping is None:
+                return
+            owner_user_id, reminder_id = mapping
+            if payload.user_id != owner_user_id:
+                return
+            list_channel_id = self._to_int(reminder_list_channel_id)
+            if list_channel_id is not None and payload.channel_id != list_channel_id:
+                return
+            try:
+                reminder_item = self._find_reminder(owner_user_id, reminder_id)
+                if reminder_item is None:
+                    return
+                self.reminder_service.toggle_recurring(owner_user_id, reminder_id)
+                await self._refresh_reminder_list_message(owner_user_id, reminder_id)
+            except (ReminderServiceError, discord.DiscordException):
+                return
 
     @app_commands.command(name="add", description="Add a new reminder")
     @app_commands.describe(
@@ -795,6 +816,9 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
             focus_text = self._build_focus_heading(reminder_item.reminder, "🗓️")
             message = await channel.send(content=focus_text, embed=embed)
             self.reminder_message_by_key[(user.id, reminder_item.id)] = message.id
+            if reminder_item.repeat != "none" or reminder_item.paused_repeat is not None:
+                await message.add_reaction(CROSS_MARK)
+                self.reminder_cross_reaction_map[message.id] = (user.id, reminder_item.id)
         except discord.DiscordException:
             return
 
@@ -817,8 +841,13 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
             embed = self._build_reminder_list_embed(user_id, reminder_item)
             focus_text = self._build_focus_heading(reminder_item.reminder, "🗓️")
             await message.edit(content=focus_text, embed=embed)
+            if (reminder_item.repeat != "none" or reminder_item.paused_repeat is not None) and \
+                    message_id not in self.reminder_cross_reaction_map:
+                await message.add_reaction(CROSS_MARK)
+                self.reminder_cross_reaction_map[message_id] = (user_id, reminder_id)
         except discord.NotFound:
             self.reminder_message_by_key.pop(key, None)
+            self.reminder_cross_reaction_map.pop(message_id, None)
         except discord.DiscordException:
             return
 
@@ -830,6 +859,7 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
 
         await self._delete_message(reminder_list_channel_id, message_id)
         self.reminder_message_by_key.pop(key, None)
+        self.reminder_cross_reaction_map.pop(message_id, None)
 
     async def _delete_message(self, channel_id: str | None, message_id: int) -> None:
         channel = await self._resolve_channel(channel_id)
@@ -845,6 +875,7 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
         self.reminder_service.reset()
         self.reminder_message_by_key.clear()
         self.reminder_reaction_map.clear()
+        self.reminder_cross_reaction_map.clear()
 
         list_channel = await self._resolve_channel(reminder_list_channel_id)
         if list_channel is None or not hasattr(list_channel, "history"):
@@ -855,7 +886,7 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
             if parsed is None:
                 continue
 
-            user_id, reminder_id, reminder_text, due_at, created_at, reminded_24h_at, fired_at, repeat = parsed
+            user_id, reminder_id, reminder_text, due_at, created_at, reminded_24h_at, fired_at, repeat, paused_repeat = parsed
             reminder_item = ReminderItem(
                 id=reminder_id,
                 reminder=reminder_text,
@@ -864,9 +895,12 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
                 reminded_24h_at=reminded_24h_at,
                 fired_at=fired_at,
                 repeat=repeat,
+                paused_repeat=paused_repeat,
             )
             self.reminder_service.load_reminder(user_id, reminder_item)
             self.reminder_message_by_key[(user_id, reminder_id)] = message.id
+            if reminder_item.repeat != "none" or reminder_item.paused_repeat is not None:
+                self.reminder_cross_reaction_map[message.id] = (user_id, reminder_id)
 
     async def _resolve_channel(self, channel_id: str | None) -> Messageable | None:
         if not channel_id:
@@ -890,7 +924,7 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
 
     def _parse_reminder_list_message(
         self, message: discord.Message
-    ) -> tuple[int, int, str, datetime, datetime, datetime | None, datetime | None, str] | None:
+    ) -> tuple[int, int, str, datetime, datetime, datetime | None, datetime | None, str, str | None] | None:
         if not message.embeds:
             return None
 
@@ -920,6 +954,8 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
         reminded_24h_at = self._extract_field_timestamp(embed, "24h Reminder Sent")
         fired_at = self._extract_field_timestamp(embed, "Due Ping Sent")
         repeat = self._embed_field_value(embed, "Repeat") or "none"
+        paused_repeat_str = self._embed_field_value(embed, "Paused Repeat") or "none"
+        paused_repeat = None if paused_repeat_str == "none" else paused_repeat_str
         return (
             user_id,
             reminder_id,
@@ -929,6 +965,7 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
             reminded_24h_at.astimezone(timezone.utc) if reminded_24h_at else None,
             fired_at.astimezone(timezone.utc) if fired_at else None,
             repeat,
+            paused_repeat,
         )
 
     def _extract_reminder_id(self, title: str | None) -> int | None:
@@ -1018,6 +1055,7 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
         embed.add_field(name="24h Reminder Sent", value=self._format_timestamp(reminder_item.reminded_24h_at), inline=True)
         embed.add_field(name="Due Ping Sent", value=self._format_timestamp(reminder_item.fired_at), inline=True)
         embed.add_field(name="Repeat", value=reminder_item.repeat, inline=True)
+        embed.add_field(name="Paused Repeat", value=reminder_item.paused_repeat or "none", inline=True)
         embed.add_field(name="Reminder", value=self._format_reminder_body(reminder_item.reminder), inline=False)
         embed.set_footer(text="Stored in reminders list channel for persistence")
         return embed
