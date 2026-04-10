@@ -22,6 +22,7 @@ class ReminderItem:
     due_at: datetime
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     reminded_24h_at: datetime | None = None
+    fired_at: datetime | None = None
 
 
 class ReminderService:
@@ -82,6 +83,30 @@ class ReminderService:
         reminder = self._get_reminder_by_id(user_id, reminder_id)
         reminder.reminded_24h_at = reminded_at or datetime.now(timezone.utc)
         return reminder
+
+    def mark_fired(
+        self, user_id: int, reminder_id: int, fired_at: datetime | None = None
+    ) -> ReminderItem:
+        reminder = self._get_reminder_by_id(user_id, reminder_id)
+        reminder.fired_at = fired_at or datetime.now(timezone.utc)
+        return reminder
+
+    def reminders_now_due(
+        self, reference_time: datetime | None = None
+    ) -> List[Tuple[int, ReminderItem]]:
+        now = reference_time or datetime.now(timezone.utc)
+        now = now.astimezone(timezone.utc)
+
+        due_reminders: List[Tuple[int, ReminderItem]] = []
+        for user_id, reminders in self._reminders_by_user.items():
+            for reminder in reminders:
+                if reminder.fired_at is not None:
+                    continue
+                if reminder.due_at <= now:
+                    due_reminders.append((user_id, reminder))
+
+        due_reminders.sort(key=lambda item: item[1].due_at)
+        return due_reminders
 
     def reminders_due_within_24_hours(
         self, reference_time: datetime | None = None

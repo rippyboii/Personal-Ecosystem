@@ -20,6 +20,7 @@ from services.reminder_service import (
 
 REMINDER_LIST_COLOR = 0xF59E0B
 REMINDER_DUE_SOON_COLOR = 0xF97316
+REMINDER_DUE_NOW_COLOR = 0xEF4444
 PICKER_TIMEZONE_CHOICES = [
     ("UTC", "UTC"),
     ("Europe/Stockholm", "Europe/Stockholm"),
@@ -547,6 +548,19 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
             except discord.DiscordException as error:
                 await self._report_error("ReminderCog._check_due_reminders", error)
 
+        now_due = self.reminder_service.reminders_now_due()
+        for user_id, reminder_item in now_due:
+            try:
+                sent = await self._send_due_now_ping(user_id, reminder_item)
+                if not sent:
+                    continue
+                self.reminder_service.mark_fired(user_id, reminder_item.id)
+                await self._refresh_reminder_list_message(user_id, reminder_item.id)
+            except ReminderServiceError as error:
+                await self._report_error("ReminderCog._check_due_reminders", error)
+            except discord.DiscordException as error:
+                await self._report_error("ReminderCog._check_due_reminders", error)
+
     async def _send_due_soon_ping(self, user_id: int, reminder_item: ReminderItem) -> bool:
         channel = await self._resolve_channel(reminder_channel_id)
         if channel is None:
@@ -556,6 +570,24 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
         focus_text = self._build_focus_heading(reminder_item.reminder, "⏰")
         content = (
             f"<@{user_id}> I am reminding you about your reminder for schedules in next 24hr.\n"
+            f"{focus_text}"
+        )
+
+        try:
+            await channel.send(content=content, embed=embed)
+            return True
+        except discord.DiscordException:
+            return False
+
+    async def _send_due_now_ping(self, user_id: int, reminder_item: ReminderItem) -> bool:
+        channel = await self._resolve_channel(reminder_channel_id)
+        if channel is None:
+            return False
+
+        embed = self._build_due_now_embed(user_id, reminder_item)
+        focus_text = self._build_focus_heading(reminder_item.reminder, "🔔")
+        content = (
+            f"<@{user_id}> Your reminder is due now!\n"
             f"{focus_text}"
         )
 
@@ -636,13 +668,14 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
             if parsed is None:
                 continue
 
-            user_id, reminder_id, reminder_text, due_at, created_at, reminded_24h_at = parsed
+            user_id, reminder_id, reminder_text, due_at, created_at, reminded_24h_at, fired_at = parsed
             reminder_item = ReminderItem(
                 id=reminder_id,
                 reminder=reminder_text,
                 due_at=due_at,
                 created_at=created_at,
                 reminded_24h_at=reminded_24h_at,
+                fired_at=fired_at,
             )
             self.reminder_service.load_reminder(user_id, reminder_item)
             self.reminder_message_by_key[(user_id, reminder_id)] = message.id
@@ -669,7 +702,7 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
 
     def _parse_reminder_list_message(
         self, message: discord.Message
-    ) -> tuple[int, int, str, datetime, datetime, datetime | None] | None:
+    ) -> tuple[int, int, str, datetime, datetime, datetime | None, datetime | None] | None:
         if not message.embeds:
             return None
 
@@ -694,6 +727,7 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
 
         created_at = self._extract_field_timestamp(embed, "Created") or message.created_at
         reminded_24h_at = self._extract_field_timestamp(embed, "24h Reminder Sent")
+        fired_at = self._extract_field_timestamp(embed, "Due Ping Sent")
         return (
             user_id,
             reminder_id,
@@ -701,6 +735,7 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
             due_at.astimezone(timezone.utc),
             created_at.astimezone(timezone.utc),
             reminded_24h_at.astimezone(timezone.utc) if reminded_24h_at else None,
+            fired_at.astimezone(timezone.utc) if fired_at else None,
         )
 
     def _extract_reminder_id(self, title: str | None) -> int | None:
@@ -769,7 +804,12 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
         return None
 
     def _build_reminder_list_embed(self, user_id: int, reminder_item: ReminderItem) -> discord.Embed:
-        status_text = "24h reminder sent" if reminder_item.reminded_24h_at else "Pending"
+        if reminder_item.fired_at:
+            status_text = "Fired"
+        elif reminder_item.reminded_24h_at:
+            status_text = "24h reminder sent"
+        else:
+            status_text = "Pending"
         embed = discord.Embed(
             title=f"Reminder #{reminder_item.id}",
             color=REMINDER_LIST_COLOR,
@@ -783,6 +823,7 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
         embed.add_field(name="Status", value=status_text, inline=True)
         embed.add_field(name="Created", value=self._format_timestamp(reminder_item.created_at), inline=True)
         embed.add_field(name="24h Reminder Sent", value=self._format_timestamp(reminder_item.reminded_24h_at), inline=True)
+        embed.add_field(name="Due Ping Sent", value=self._format_timestamp(reminder_item.fired_at), inline=True)
         embed.add_field(name="Reminder", value=self._format_reminder_body(reminder_item.reminder), inline=False)
         embed.set_footer(text="Stored in reminders list channel for persistence")
         return embed
@@ -800,6 +841,21 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
         )
         embed.add_field(name="Reminder", value=self._format_reminder_body(reminder_item.reminder), inline=False)
         embed.set_footer(text="Reminder for the next 24 hours")
+        return embed
+
+    def _build_due_now_embed(self, user_id: int, reminder_item: ReminderItem) -> discord.Embed:
+        embed = discord.Embed(
+            title=f"Reminder #{reminder_item.id} — Due Now",
+            color=REMINDER_DUE_NOW_COLOR,
+        )
+        embed.add_field(name="Owner", value=f"<@{user_id}>", inline=True)
+        embed.add_field(
+            name="Due",
+            value=f"{self._format_timestamp(reminder_item.due_at)} ({self._format_relative_timestamp(reminder_item.due_at)})",
+            inline=True,
+        )
+        embed.add_field(name="Reminder", value=self._format_reminder_body(reminder_item.reminder), inline=False)
+        embed.set_footer(text="This reminder is now due.")
         return embed
 
     def _build_focus_heading(self, reminder_text: str, icon: str) -> str:
