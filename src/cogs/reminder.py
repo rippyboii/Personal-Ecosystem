@@ -953,7 +953,8 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
         created_at = self._extract_field_timestamp(embed, "Created") or message.created_at
         reminded_24h_at = self._extract_field_timestamp(embed, "24h Reminder Sent")
         fired_at = self._extract_field_timestamp(embed, "Due Ping Sent")
-        repeat = self._embed_field_value(embed, "Repeat") or "none"
+        repeat_raw = self._embed_field_value(embed, "Repeat") or "none"
+        repeat = re.sub(r"\s*\((?:ON|OFF)\)\s*$", "", repeat_raw).strip() or "none"
         paused_repeat_str = self._embed_field_value(embed, "Paused Repeat") or "none"
         paused_repeat = None if paused_repeat_str == "none" else paused_repeat_str
         return (
@@ -1054,7 +1055,13 @@ class ReminderCog(commands.GroupCog, group_name="reminder", group_description="M
         embed.add_field(name="Created", value=self._format_timestamp(reminder_item.created_at), inline=True)
         embed.add_field(name="24h Reminder Sent", value=self._format_timestamp(reminder_item.reminded_24h_at), inline=True)
         embed.add_field(name="Due Ping Sent", value=self._format_timestamp(reminder_item.fired_at), inline=True)
-        embed.add_field(name="Repeat", value=reminder_item.repeat, inline=True)
+        if reminder_item.repeat != "none":
+            repeat_display = f"{reminder_item.repeat} (ON)"
+        elif reminder_item.paused_repeat is not None:
+            repeat_display = f"{reminder_item.paused_repeat} (OFF)"
+        else:
+            repeat_display = "none"
+        embed.add_field(name="Repeat", value=repeat_display, inline=True)
         embed.add_field(name="Paused Repeat", value=reminder_item.paused_repeat or "none", inline=True)
         embed.add_field(name="Reminder", value=self._format_reminder_body(reminder_item.reminder), inline=False)
         embed.set_footer(text="Stored in reminders list channel for persistence")
