@@ -7,10 +7,11 @@ import discord
 from discord.app_commands import AppCommandError
 from discord.ext import commands
 
-from config import TOKEN, bot_log_channel_id, error_log_channel_id
+from config import TOKEN, bot_log_channel_id, error_log_channel_id, message_content_intent_enabled
 
 
 intents = discord.Intents.default()
+intents.message_content = message_content_intent_enabled
 pes = commands.Bot(command_prefix="!", intents=intents)
 
 
@@ -129,12 +130,15 @@ async def setup_hook() -> None:
     loop.set_exception_handler(loop_exception_handler)
 
     await pes.load_extension("cogs.todo")
+    await pes.load_extension("cogs.reminder")
     await pes.tree.sync()
 
 
 @pes.event
 async def on_ready() -> None:
     print(f"Logged in as {pes.user}")
+    if not message_content_intent_enabled:
+        print("Message content intent is disabled. Prefix commands like !reminder are unavailable.")
 
     if bot_log_channel_id:
         channel = pes.get_channel(int(bot_log_channel_id))

@@ -594,5 +594,3 @@ class TestOnRawReactionAdd:
         payload = self._make_payload(channel_id=999999999999999999)
         await self.cog.on_raw_reaction_add(payload)
         assert self.cog.todo_service.list_todos(1)[0].completed is False
-
-o
