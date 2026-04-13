@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 import re
+import aiosqlite
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
-from typing import Sequence
 from services.db import get_db
 
 VALID_SCHEDULES = {"daily", "mon", "tue", "wed", "thu", "fri", "sat", "sun"}
