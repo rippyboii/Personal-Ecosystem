@@ -8,6 +8,8 @@ from discord.app_commands import AppCommandError
 from discord.ext import commands
 
 from config import TOKEN, bot_log_channel_id, error_log_channel_id, message_content_intent_enabled
+from config import sqlite_db_path
+from services.db import init_db, close_db
 
 
 intents = discord.Intents.default()
@@ -129,8 +131,11 @@ async def setup_hook() -> None:
 
     loop.set_exception_handler(loop_exception_handler)
 
+    await init_db(sqlite_db_path)       
+
     await pes.load_extension("cogs.todo")
     await pes.load_extension("cogs.reminder")
+    await pes.load_extension("cogs.streak")   
     await pes.tree.sync()
 
 
@@ -148,6 +153,9 @@ async def on_ready() -> None:
             raise ValueError(f"Channel with ID {bot_log_channel_id} not found.")
     print("Bot is ONLINE! BINGO!!")
 
+@pes.event
+async def on_close() -> None:
+    await close_db()
 
 @pes.event
 async def on_error(event_method: str, *args, **kwargs) -> None:  # noqa: ARG001
