@@ -432,6 +432,31 @@ class StreakService:
             rows = await cur.fetchall()
         return [_row_to_log(r) for r in rows]
 
+    async def get_all_streaks(self) -> list[StreakRecord]:
+        """Returns every streak across all users (used for daily due-card task)."""
+        db = await get_db()
+        async with db.execute(
+            "SELECT * FROM streaks ORDER BY user_id, created_at"
+        ) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_streak(r) for r in rows]
+
+    async def is_logged_today(self, streak_id: int) -> bool:
+        """Returns True if this streak has already been logged today (UTC)."""
+        db = await get_db()
+        today = date.today().isoformat()
+        async with db.execute(
+            "SELECT id FROM streak_logs WHERE streak_id = ? AND DATE(logged_at) = ?",
+            (streak_id, today),
+        ) as cur:
+            return await cur.fetchone() is not None
+
+    @staticmethod
+    def is_scheduled_today(streak: StreakRecord) -> bool:
+        """Returns True if the streak is active on today's weekday."""
+        active = _active_days(streak.schedule)
+        return _is_active_day(date.today(), active)
+
 
 # ------------------------------------------------------------------
 # Row helpers

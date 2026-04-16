@@ -136,6 +136,7 @@ class StreakLogModal(discord.ui.Modal, title="Log Activity"):
                 f"Logged **{self.streak_name}**!{mood_str} 🔥"
             )
             await self.cog._refresh_streak_card(interaction.user.id, self.streak_id)
+            await self.cog._remove_due_card(interaction.user.id, self.streak_id)
             await self.cog._check_milestone(interaction.user, self.streak_id)
         except AlreadyLoggedTodayError as e:
             await interaction.response.send_message(str(e), ephemeral=True)
@@ -210,7 +211,8 @@ class StreakCog(commands.GroupCog, group_name="streak", group_description="Manag
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
         self.service = StreakService()
-        self.streak_card_map: dict[tuple[int, int], int] = {}  # (user_id, streak_id) -> message_id
+        self.streak_card_map: dict[tuple[int, int], int] = {}  # (user_id, streak_id) -> message_id in list channel
+        self.due_card_map: dict[tuple[int, int], int] = {}     # (user_id, streak_id) -> message_id in streak channel
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -220,9 +222,12 @@ class StreakCog(commands.GroupCog, group_name="streak", group_description="Manag
     async def on_ready(self) -> None:
         if not self.weekly_summary_task.is_running():
             self.weekly_summary_task.start()
+        if not self.daily_due_task.is_running():
+            self.daily_due_task.start()
 
     def cog_unload(self) -> None:
         self.weekly_summary_task.cancel()
+        self.daily_due_task.cancel()
 
     # ------------------------------------------------------------------
     # Commands
@@ -387,28 +392,52 @@ class StreakCog(commands.GroupCog, group_name="streak", group_description="Manag
         if str(payload.emoji) != "✅":
             return
 
-        for (user_id, streak_id), message_id in list(self.streak_card_map.items()):
-            if message_id == payload.message_id and user_id == payload.user_id:
-                try:
-                    await self.service.log_activity(user_id, streak_id)
-                    await self._refresh_streak_card(user_id, streak_id)
-                    user = await self.bot.fetch_user(user_id)
-                    await self._check_milestone(user, streak_id)
-                except AlreadyLoggedTodayError:
-                    pass  # silent — already logged today
-                except Exception as e:
-                    await self._report_error("StreakCog.on_raw_reaction_add", e)
-                break
+        # Check both maps: persistent streak cards and daily due cards
+        for card_map in (self.streak_card_map, self.due_card_map):
+            for (user_id, streak_id), message_id in list(card_map.items()):
+                if message_id == payload.message_id and user_id == payload.user_id:
+                    await self._handle_quick_log(user_id, streak_id)
+                    return
+
+    async def _handle_quick_log(self, user_id: int, streak_id: int) -> None:
+        try:
+            await self.service.log_activity(user_id, streak_id)
+            await self._refresh_streak_card(user_id, streak_id)
+            await self._remove_due_card(user_id, streak_id)
+            user = await self.bot.fetch_user(user_id)
+            await self._check_milestone(user, streak_id)
+        except AlreadyLoggedTodayError:
+            pass  # silent — already logged today
+        except Exception as e:
+            await self._report_error("StreakCog._handle_quick_log", e)
 
     # ------------------------------------------------------------------
-    # Background task
+    # Background tasks
     # ------------------------------------------------------------------
+
+    @tasks.loop(time=dtime(hour=8, minute=0))
+    async def daily_due_task(self) -> None:
+        """Every morning: clear yesterday's due cards, post today's for unlogged streaks."""
+        # Clear previous due cards
+        for message_id in list(self.due_card_map.values()):
+            await self._delete_message(streak_channel_id, message_id)
+        self.due_card_map.clear()
+
+        # Post due cards for every streak that is scheduled today and not yet logged
+        all_streaks = await self.service.get_all_streaks()
+        for streak in all_streaks:
+            if not self.service.is_scheduled_today(streak):
+                continue
+            if await self.service.is_logged_today(streak.id):
+                continue
+            await self._post_due_card(streak.user_id, streak.id)
 
     @tasks.loop(time=dtime(hour=9, minute=0))
     async def weekly_summary_task(self) -> None:
         if datetime.now(timezone.utc).weekday() != 0:  # Monday only
             return
-        user_ids = {uid for uid, _ in self.streak_card_map}
+        all_streaks = await self.service.get_all_streaks()
+        user_ids = {s.user_id for s in all_streaks}
         channel = await self._resolve_channel(streak_channel_id)
         if channel is None:
             return
@@ -445,6 +474,42 @@ class StreakCog(commands.GroupCog, group_name="streak", group_description="Manag
                 color=MILESTONE_COLOR,
             )
             await channel.send(embed=embed)
+
+    # ------------------------------------------------------------------
+    # Due card helpers
+    # ------------------------------------------------------------------
+
+    def _build_due_card(self, user_id: int, stats: StreakStats) -> discord.Embed:
+        s = stats.streak
+        fire = "🔥" * min(stats.current_streak, 5) if stats.current_streak else ""
+        embed = discord.Embed(
+            title=f"⏰ {s.name}",
+            description=(
+                f"<@{user_id}> — **{stats.current_streak}** day streak {fire}\n"
+                f"Log it to keep the streak going!"
+            ),
+            color=0xF59E0B,
+        )
+        return embed
+
+    async def _post_due_card(self, user_id: int, streak_id: int) -> None:
+        channel = await self._resolve_channel(streak_channel_id)
+        if channel is None:
+            return
+        try:
+            stats = await self.service.get_stats(user_id, streak_id)
+        except Exception:
+            return
+        embed = self._build_due_card(user_id, stats)
+        message = await channel.send(content=f"<@{user_id}>", embed=embed)
+        await message.add_reaction("✅")
+        self.due_card_map[(user_id, streak_id)] = message.id
+
+    async def _remove_due_card(self, user_id: int, streak_id: int) -> None:
+        key = (user_id, streak_id)
+        message_id = self.due_card_map.pop(key, None)
+        if message_id:
+            await self._delete_message(streak_channel_id, message_id)
 
     # ------------------------------------------------------------------
     # Streak card helpers
