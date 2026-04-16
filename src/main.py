@@ -8,7 +8,7 @@ from discord.app_commands import AppCommandError
 from discord.ext import commands
 
 from config import TOKEN, bot_log_channel_id, error_log_channel_id, message_content_intent_enabled
-from config import sqlite_db_path
+from config import sqlite_db_path, dev_guild_id
 from services.db import init_db, close_db
 
 
@@ -135,8 +135,19 @@ async def setup_hook() -> None:
 
     await pes.load_extension("cogs.todo")
     await pes.load_extension("cogs.reminder")
-    await pes.load_extension("cogs.streak")   
-    await pes.tree.sync()
+    await pes.load_extension("cogs.streak")
+
+    if dev_guild_id:
+        guild = discord.Object(id=int(dev_guild_id))
+        pes.tree.copy_global_to(guild=guild)
+        await pes.tree.sync(guild=guild)
+        # Clear any stale global commands so they don't show up as duplicates
+        pes.tree.clear_commands(guild=None)
+        await pes.tree.sync()
+        print(f"Commands synced to dev guild {dev_guild_id} (instant)")
+    else:
+        await pes.tree.sync()
+        print("Commands synced globally (may take up to 1 hour)")
 
 
 @pes.event

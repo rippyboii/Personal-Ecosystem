@@ -244,8 +244,10 @@ class TestComputeCurrentStreak:
         assert compute_current_streak(dates, set(), "daily", reference=today) == 3
 
     def test_gap_breaks_streak(self):
+        # The algorithm has a 1-day grace window (yesterday), so a gap of 2+
+        # active days (i.e. missing yesterday AND 2-days-ago) breaks the streak.
         today = date.today()
-        dates = [today, today - timedelta(days=2)]
+        dates = [today, today - timedelta(days=3)]
         assert compute_current_streak(dates, set(), "daily", reference=today) == 1
 
     def test_freeze_fills_gap(self):
