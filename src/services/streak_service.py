@@ -422,6 +422,16 @@ class StreakService:
         streaks = await self.list_streaks(user_id)
         return [await self.get_stats(user_id, s.id) for s in streaks]
 
+    async def get_logs(self, user_id: int, streak_id: int) -> list[StreakLog]:
+        await self.get_streak(user_id, streak_id)  # ownership check
+        db = await get_db()
+        async with db.execute(
+            "SELECT * FROM streak_logs WHERE streak_id = ? ORDER BY logged_at DESC",
+            (streak_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [_row_to_log(r) for r in rows]
+
 
 # ------------------------------------------------------------------
 # Row helpers

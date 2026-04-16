@@ -11,6 +11,7 @@ from config import streak_channel_id, streak_list_channel_id
 from services.streak_service import (
     StreakService,
     StreakStats,
+    StreakLog,
     StreakNotFoundError,
     StreakValidationError,
     AlreadyLoggedTodayError,
@@ -21,6 +22,63 @@ MOOD_EMOJI = {1: "😞", 2: "😐", 3: "🙂", 4: "😀", 5: "🔥"}
 STREAK_CARD_COLOR = 0x6366F1
 STREAK_DONE_COLOR = 0x10B981
 MILESTONE_COLOR   = 0xF59E0B
+LOGS_PER_PAGE     = 10
+
+
+class StreakHistoryView(discord.ui.View):
+    def __init__(self, user_id: int, streak_name: str, logs: list[StreakLog]) -> None:
+        super().__init__(timeout=120)
+        self.user_id = user_id
+        self.streak_name = streak_name
+        self.logs = logs
+        self.page = 0
+        self.total_pages = max(1, (len(logs) + LOGS_PER_PAGE - 1) // LOGS_PER_PAGE)
+        self._update_buttons()
+
+    def _update_buttons(self) -> None:
+        self.prev_button.disabled = self.page == 0
+        self.next_button.disabled = self.page >= self.total_pages - 1
+
+    def build_embed(self) -> discord.Embed:
+        embed = discord.Embed(
+            title=f"📋 {self.streak_name} — Full History",
+            color=STREAK_CARD_COLOR,
+        )
+        if not self.logs:
+            embed.description = "No logs yet."
+            return embed
+
+        start = self.page * LOGS_PER_PAGE
+        page_logs = self.logs[start : start + LOGS_PER_PAGE]
+        lines = []
+        for log in page_logs:
+            mood_str = f" {MOOD_EMOJI[log.mood]}" if log.mood else ""
+            tag_str = f" `{', '.join(log.tags)}`" if log.tags else ""
+            note_preview = (log.note[:80] + "…") if log.note and len(log.note) > 80 else (log.note or "")
+            note_str = f" — {note_preview}" if note_preview else ""
+            lines.append(f"`{log.logged_at.date()}`{mood_str}{tag_str}{note_str}")
+
+        embed.description = "\n".join(lines)
+        embed.set_footer(text=f"Page {self.page + 1} of {self.total_pages} • {len(self.logs)} total logs")
+        return embed
+
+    @discord.ui.button(label="◀ Prev", style=discord.ButtonStyle.secondary)
+    async def prev_button(self, interaction: discord.Interaction, _button: discord.ui.Button) -> None:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your history.", ephemeral=True)
+            return
+        self.page -= 1
+        self._update_buttons()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.secondary)
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This isn't your history.", ephemeral=True)
+            return
+        self.page += 1
+        self._update_buttons()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
 
 class StreakLogModal(discord.ui.Modal, title="Log Activity"):
@@ -268,6 +326,19 @@ class StreakCog(commands.GroupCog, group_name="streak", group_description="Manag
                     inline=False,
                 )
             await interaction.response.send_message(embed=embed)
+        except StreakNotFoundError:
+            await interaction.response.send_message(
+                f"No streak named '{name}'.", ephemeral=True
+            )
+
+    @app_commands.command(name="history", description="View full log history for a streak")
+    @app_commands.describe(name="Name of the streak")
+    async def streak_history(self, interaction: discord.Interaction, name: str) -> None:
+        try:
+            streak = await self.service.get_streak_by_name(interaction.user.id, name)
+            logs = await self.service.get_logs(interaction.user.id, streak.id)
+            view = StreakHistoryView(interaction.user.id, streak.name, logs)
+            await interaction.response.send_message(embed=view.build_embed(), view=view)
         except StreakNotFoundError:
             await interaction.response.send_message(
                 f"No streak named '{name}'.", ephemeral=True
